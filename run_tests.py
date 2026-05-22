@@ -1,7 +1,10 @@
-import sys
 import unittest
 
-from basic_test_framework import hello_bas_line_coverage, hello_bas_transpiled_javascript
+from basic_test_framework import (
+    hello_bas_line_coverage,
+    hello_bas_transpiled_js_line_coverage,
+    hello_bas_transpiled_javascript,
+)
 
 
 def main() -> int:
@@ -10,11 +13,15 @@ def main() -> int:
     print("hello.bas transpiled JavaScript:")
     print(hello_bas_transpiled_javascript())
     covered, total, percent, missing = hello_bas_line_coverage()
+    js_covered, js_total, js_percent, js_missing = hello_bas_transpiled_js_line_coverage()
     print(f"hello.bas line coverage: {covered}/{total} ({percent:.1f}%)")
+    print(f"transpiled JS mapped coverage: {js_covered}/{js_total} ({js_percent:.1f}%)")
     if missing:
-        print(f"Missing hello.bas lines: {', '.join(str(line) for line in missing)}")
+        print(f"Missing hello.bas lines (BASIC runtime): {', '.join(str(line) for line in missing)}")
+    if js_missing:
+        print(f"Missing hello.bas lines (transpiled JS runtime): {', '.join(str(line) for line in js_missing)}")
 
-    return 0 if result.wasSuccessful() and percent == 100.0 else 1
+    return 0 if result.wasSuccessful() and percent == 100.0 and js_percent == 100.0 else 1
 
 
 if __name__ == "__main__":
