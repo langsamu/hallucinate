@@ -36,6 +36,7 @@ class BasicRuntime:
         self.pc: int = min(program.lines)
         self.line_order = sorted(program.lines)
         self.fault_once_lines = set(fault_once_lines or set())
+        self.executed_lines: set[int] = set()
 
     def run(
         self,
@@ -54,6 +55,7 @@ class BasicRuntime:
             steps += 1
 
             line = self.pc
+            self.executed_lines.add(line)
             statement = self.program.lines[line]
             try:
                 if line in self.fault_once_lines:

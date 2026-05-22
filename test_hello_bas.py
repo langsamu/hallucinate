@@ -1,6 +1,6 @@
 import unittest
 
-from basic_test_framework import run_hello_program
+from basic_test_framework import hello_bas_line_coverage, run_hello_program
 
 
 class HelloBasProgramTests(unittest.TestCase):
@@ -38,6 +38,12 @@ class HelloBasProgramTests(unittest.TestCase):
         )
         self.assertEqual(runtime.output, ["0 HELLO WORLD"])
         self.assertEqual(runtime.vars["MESSAGE$"], "HELLO WORLD")
+
+    def test_hello_bas_has_full_line_coverage(self) -> None:
+        covered, total, percent, missing = hello_bas_line_coverage()
+        self.assertEqual((covered, total), (13, 13))
+        self.assertEqual(percent, 100.0)
+        self.assertEqual(missing, [])
 
 
 if __name__ == "__main__":

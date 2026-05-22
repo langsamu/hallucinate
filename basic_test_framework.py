@@ -27,3 +27,22 @@ def run_hello_program(
         start_line=start_line,
     )
     return runtime
+
+
+def hello_bas_line_coverage() -> tuple[int, int, float, list[int]]:
+    program = BasicProgram.from_file(HELLO_BAS)
+    covered: set[int] = set()
+
+    loop_runtime = BasicRuntime(program)
+    loop_runtime.run(stop_after_prints=2)
+    covered.update(loop_runtime.executed_lines)
+
+    recovery_runtime = BasicRuntime(program, fault_once_lines={210})
+    recovery_runtime.run(stop_after_prints=1)
+    covered.update(recovery_runtime.executed_lines)
+
+    all_lines = sorted(program.lines)
+    missing = [line for line in all_lines if line not in covered]
+    total = len(all_lines)
+    percent = 100.0 if total == 0 else (len(covered) * 100.0 / total)
+    return len(covered), total, percent, missing

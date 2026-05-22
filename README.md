@@ -21,4 +21,5 @@ Single-program, enterprise-grade BASIC infinite loop:
 Execution-based unit tests are provided via a small BASIC emulator.
 
 - Run locally: `python run_tests.py`
-- CI runs the same command in GitHub Actions (`.github/workflows/tests.yml`)
+- The test runner reports `hello.bas` line coverage and requires 100%.
+- CI runs the same command and coverage check in GitHub Actions (`.github/workflows/tests.yml`)
