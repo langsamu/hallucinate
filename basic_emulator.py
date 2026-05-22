@@ -33,6 +33,8 @@ class BasicRuntime:
         self.output: list[str] = []
         self.call_stack: list[int] = []
         self.error_handler_line: int | None = None
+        self.error_handler_mode: str | None = None
+        self.resume_line: int | None = None
         self.pc: int = min(program.lines)
         self.line_order = sorted(program.lines)
         self.fault_once_lines = set(fault_once_lines or set())
@@ -65,6 +67,8 @@ class BasicRuntime:
             except Exception:
                 if self.error_handler_line is None:
                     raise
+                if self.error_handler_mode == "gosub":
+                    self.resume_line = self._next_line(line)
                 self.pc = self.error_handler_line
 
             if stop_after_prints is not None and len(self.output) >= stop_after_prints:
@@ -84,6 +88,13 @@ class BasicRuntime:
 
         if statement.startswith("ON ERROR GOTO "):
             self.error_handler_line = int(statement.removeprefix("ON ERROR GOTO ").strip())
+            self.error_handler_mode = "goto"
+            self.pc = self._next_line(self.pc)
+            return
+
+        if statement.startswith("ON ERROR GOSUB "):
+            self.error_handler_line = int(statement.removeprefix("ON ERROR GOSUB ").strip())
+            self.error_handler_mode = "gosub"
             self.pc = self._next_line(self.pc)
             return
 
@@ -104,6 +115,13 @@ class BasicRuntime:
             if not self.call_stack:
                 raise RuntimeError("RETURN without GOSUB")
             self.pc = self.call_stack.pop()
+            return
+
+        if statement == "RESUME NEXT":
+            if self.resume_line is None:
+                raise RuntimeError("RESUME NEXT without active error")
+            self.pc = self.resume_line
+            self.resume_line = None
             return
 
         if statement.startswith("RESUME "):

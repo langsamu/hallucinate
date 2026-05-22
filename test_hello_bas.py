@@ -33,7 +33,7 @@ class HelloBasProgramTests(unittest.TestCase):
 
     def test_error_handler_recovers_and_resumes_loop(self) -> None:
         runtime = run_hello_program(
-            fault_once_lines={2200},
+            fault_once_lines={2100},
             stop_after_prints=1,
         )
         self.assertEqual(runtime.output, ["0 HELLO WORLD"])

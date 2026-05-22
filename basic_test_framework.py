@@ -37,7 +37,7 @@ def hello_bas_line_coverage() -> tuple[int, int, float, list[int]]:
     loop_runtime.run(stop_after_prints=2)
     covered.update(loop_runtime.executed_lines)
 
-    recovery_runtime = BasicRuntime(program, fault_once_lines={2200})
+    recovery_runtime = BasicRuntime(program, fault_once_lines={2100})
     recovery_runtime.run(stop_after_prints=1)
     covered.update(recovery_runtime.executed_lines)
 
