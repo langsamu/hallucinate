@@ -17,3 +17,8 @@ Single-program, enterprise-grade BASIC infinite loop:
 900 MESSAGE$ = "HELLO WORLD"
 910 RESUME 50
 ```
+
+Execution-based unit tests are provided via a small BASIC emulator.
+
+- Run locally: `python run_tests.py`
+- CI runs the same command in GitHub Actions (`.github/workflows/tests.yml`)

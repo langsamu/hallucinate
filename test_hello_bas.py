@@ -1,52 +1,43 @@
 import unittest
-from pathlib import Path
 
-
-REPO_ROOT = Path(__file__).resolve().parent
-HELLO_BAS = REPO_ROOT / "hello.bas"
-
-
-def parse_basic_lines(path: Path) -> dict[int, str]:
-    program = {}
-    for raw_line in path.read_text().splitlines():
-        if not raw_line.strip():
-            continue
-        line_no_text, statement = raw_line.strip().split(" ", 1)
-        program[int(line_no_text)] = statement.strip()
-    return program
+from basic_test_framework import run_hello_program
 
 
 class HelloBasProgramTests(unittest.TestCase):
-    def test_program_has_expected_line_numbers(self) -> None:
-        program = parse_basic_lines(HELLO_BAS)
+    def test_emulator_runs_loop_and_prints_incrementing_iterations(self) -> None:
+        runtime = run_hello_program(stop_after_prints=3)
         self.assertEqual(
-            sorted(program.keys()),
-            [10, 20, 30, 40, 50, 60, 200, 210, 220, 230, 240, 900, 910],
+            runtime.output,
+            ["0 HELLO WORLD", "1 HELLO WORLD", "2 HELLO WORLD"],
         )
 
-    def test_main_loop_initializes_and_loops(self) -> None:
-        program = parse_basic_lines(HELLO_BAS)
-        self.assertEqual(program[20], "ON ERROR GOTO 900")
-        self.assertEqual(program[30], 'MESSAGE$ = "HELLO WORLD"')
-        self.assertEqual(program[40], "ITERATION% = 0")
-        self.assertEqual(program[50], "GOSUB 200")
-        self.assertEqual(program[60], "GOTO 50")
-
-    def test_subroutine_prints_and_resets_counter(self) -> None:
-        program = parse_basic_lines(HELLO_BAS)
-        self.assertEqual(
-            program[200],
-            'IF LEN(MESSAGE$) = 0 THEN MESSAGE$ = "HELLO WORLD"',
+    def test_guard_replaces_empty_message(self) -> None:
+        runtime = run_hello_program(
+            start_line=200,
+            initial_vars={"MESSAGE$": "", "ITERATION%": 7},
+            stop_after_prints=1,
         )
-        self.assertEqual(program[210], 'PRINT ITERATION%; " "; MESSAGE$')
-        self.assertEqual(program[220], "ITERATION% = ITERATION% + 1")
-        self.assertEqual(program[230], "IF ITERATION% > 9999 THEN ITERATION% = 0")
-        self.assertEqual(program[240], "RETURN")
+        self.assertEqual(
+            runtime.output,
+            ["7 HELLO WORLD"],
+        )
+        self.assertEqual(runtime.vars["MESSAGE$"], "HELLO WORLD")
 
-    def test_error_handler_recovers_to_loop(self) -> None:
-        program = parse_basic_lines(HELLO_BAS)
-        self.assertEqual(program[900], 'MESSAGE$ = "HELLO WORLD"')
-        self.assertEqual(program[910], "RESUME 50")
+    def test_counter_wraps_after_9999(self) -> None:
+        runtime = run_hello_program(
+            start_line=50,
+            initial_vars={"MESSAGE$": "HELLO WORLD", "ITERATION%": 9999},
+            stop_after_prints=2,
+        )
+        self.assertEqual(runtime.output, ["9999 HELLO WORLD", "0 HELLO WORLD"])
+
+    def test_error_handler_recovers_and_resumes_loop(self) -> None:
+        runtime = run_hello_program(
+            fault_once_lines={210},
+            stop_after_prints=1,
+        )
+        self.assertEqual(runtime.output, ["0 HELLO WORLD"])
+        self.assertEqual(runtime.vars["MESSAGE$"], "HELLO WORLD")
 
 
 if __name__ == "__main__":
