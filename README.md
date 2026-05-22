@@ -14,5 +14,6 @@ It is not duplicated here to keep the source of truth in one file.
 Execution-based unit tests are provided via a small BASIC emulator.
 
 - Run locally: `python run_tests.py`
+- The test runner emits `hello.bas` transpiled to JavaScript.
 - The test runner reports `hello.bas` line coverage and requires 100%.
 - CI runs the same command and coverage check in GitHub Actions (`.github/workflows/tests.yml`)

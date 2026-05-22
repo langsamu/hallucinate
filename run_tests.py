@@ -1,12 +1,14 @@
 import sys
 import unittest
 
-from basic_test_framework import hello_bas_line_coverage
+from basic_test_framework import hello_bas_line_coverage, hello_bas_transpiled_javascript
 
 
 def main() -> int:
     suite = unittest.defaultTestLoader.discover(".")
     result = unittest.TextTestRunner(verbosity=2).run(suite)
+    print("hello.bas transpiled JavaScript:")
+    print(hello_bas_transpiled_javascript())
     covered, total, percent, missing = hello_bas_line_coverage()
     print(f"hello.bas line coverage: {covered}/{total} ({percent:.1f}%)")
     if missing:

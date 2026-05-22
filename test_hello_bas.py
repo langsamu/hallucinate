@@ -1,6 +1,10 @@
 import unittest
 
-from basic_test_framework import hello_bas_line_coverage, run_hello_program
+from basic_test_framework import (
+    hello_bas_line_coverage,
+    hello_bas_transpiled_javascript,
+    run_hello_program,
+)
 
 
 class HelloBasProgramTests(unittest.TestCase):
@@ -44,6 +48,14 @@ class HelloBasProgramTests(unittest.TestCase):
         self.assertEqual(covered, total)
         self.assertEqual(percent, 100.0)
         self.assertEqual(missing, [])
+
+    def test_emulator_can_transpile_hello_bas_to_javascript(self) -> None:
+        transpiled = hello_bas_transpiled_javascript()
+        self.assertIn("function runBasicProgram", transpiled)
+        self.assertIn("case 10:", transpiled)
+        self.assertIn("case 2210:", transpiled)
+        self.assertIn('output.push(String((vars[\'ITERATION%\'] ?? 0)) + String(" ") + String((vars[\'MESSAGE$\'] ?? \'\')));', transpiled)
+        self.assertIn('errorHandler = { mode: "gosub", target: 1900 };', transpiled)
 
 
 if __name__ == "__main__":

@@ -19,6 +19,161 @@ class BasicProgram:
             lines[int(line_no_text)] = statement.strip()
         return cls(lines=lines)
 
+    def transpile_to_javascript(self) -> str:
+        line_order = sorted(self.lines)
+        next_line_map: dict[int, int | None] = {
+            line: (line_order[i + 1] if i + 1 < len(line_order) else None)
+            for i, line in enumerate(line_order)
+        }
+
+        def js_var(name: str) -> str:
+            return f'vars[{name!r}]'
+
+        def js_expr(expr: str) -> str:
+            expr = expr.strip()
+            if expr.startswith('"') and expr.endswith('"'):
+                return expr
+            if expr.isdigit():
+                return expr
+            if "+" in expr:
+                left, right = expr.split("+", 1)
+                return f"(Number({js_expr(left)}) + Number({js_expr(right)}))"
+            len_match = re.fullmatch(r"LEN\(([^)]+)\)", expr)
+            if len_match:
+                inner = len_match.group(1).strip()
+                return f"(String({js_var(inner)} ?? '')).length"
+            if expr.endswith("%"):
+                return f"({js_var(expr)} ?? 0)"
+            if expr.endswith("$"):
+                return f"({js_var(expr)} ?? '')"
+            return f"({js_var(expr)} ?? null)"
+
+        def js_condition(text: str) -> str:
+            if " > " in text:
+                left, right = text.split(" > ", 1)
+                return f"(Number({js_expr(left)}) > Number({js_expr(right)}))"
+            if " = " in text:
+                left, right = text.split(" = ", 1)
+                return f"({js_expr(left)} === {js_expr(right)})"
+            raise RuntimeError(f"unsupported condition for transpilation: {text}")
+
+        def js_next_line(line: int) -> str:
+            next_line = next_line_map[line]
+            return "null" if next_line is None else str(next_line)
+
+        def js_statement(statement: str, line: int, indent: str = "          ") -> list[str]:
+            if statement.startswith("REM "):
+                return [
+                    f"{indent}// {statement.removeprefix('REM ').strip()}",
+                    f"{indent}pc = {js_next_line(line)};",
+                ]
+            if statement.startswith("ON ERROR GOTO "):
+                target = int(statement.removeprefix("ON ERROR GOTO ").strip())
+                return [
+                    f'{indent}errorHandler = {{ mode: "goto", target: {target} }};',
+                    f"{indent}pc = {js_next_line(line)};",
+                ]
+            if statement.startswith("ON ERROR GOSUB "):
+                target = int(statement.removeprefix("ON ERROR GOSUB ").strip())
+                return [
+                    f'{indent}errorHandler = {{ mode: "gosub", target: {target} }};',
+                    f"{indent}pc = {js_next_line(line)};",
+                ]
+            if statement.startswith("GOSUB "):
+                target = int(statement.removeprefix("GOSUB ").strip())
+                return [
+                    f"{indent}const returnLine_{line} = nextLine(pc);",
+                    f"{indent}if (returnLine_{line} === null) throw new Error('GOSUB has no return line');",
+                    f"{indent}callStack.push(returnLine_{line});",
+                    f"{indent}pc = {target};",
+                ]
+            if statement.startswith("GOTO "):
+                target = int(statement.removeprefix("GOTO ").strip())
+                return [f"{indent}pc = {target};"]
+            if statement == "RETURN":
+                return [
+                    f"{indent}if (!callStack.length) throw new Error('RETURN without GOSUB');",
+                    f"{indent}pc = callStack.pop();",
+                ]
+            if statement == "RESUME NEXT":
+                return [
+                    f"{indent}if (resumeLine === null) throw new Error('RESUME NEXT without active error');",
+                    f"{indent}pc = resumeLine;",
+                    f"{indent}resumeLine = null;",
+                ]
+            if statement.startswith("RESUME "):
+                target = int(statement.removeprefix("RESUME ").strip())
+                return [f"{indent}pc = {target};"]
+            if statement.startswith("PRINT "):
+                parts = [part.strip() for part in statement.removeprefix("PRINT ").split(";")]
+                rendered = " + ".join(f"String({js_expr(part)})" for part in parts) or '""'
+                return [
+                    f"{indent}output.push({rendered});",
+                    f"{indent}pc = {js_next_line(line)};",
+                ]
+            if statement.startswith("IF ") and " THEN " in statement:
+                condition_text, then_statement = statement[3:].split(" THEN ", 1)
+                then_lines = js_statement(then_statement.strip(), line, indent + "  ")
+                return [
+                    f"{indent}if {js_condition(condition_text.strip())} {{",
+                    *then_lines,
+                    f"{indent}}} else {{",
+                    f"{indent}  pc = {js_next_line(line)};",
+                    f"{indent}}}",
+                ]
+            if "=" in statement:
+                name, expr = statement.split("=", 1)
+                return [
+                    f"{indent}{js_var(name.strip())} = {js_expr(expr.strip())};",
+                    f"{indent}pc = {js_next_line(line)};",
+                ]
+            raise RuntimeError(f"unsupported statement for transpilation: {statement}")
+
+        js_lines: list[str] = [
+            "function runBasicProgram({ maxSteps = 100000, stopAfterPrints = null } = {}) {",
+            "  const vars = Object.create(null);",
+            "  const output = [];",
+            "  const callStack = [];",
+            "  let errorHandler = null;",
+            "  let resumeLine = null;",
+            f"  let pc = {line_order[0] if line_order else 'null'};",
+            f"  const lineOrder = [{', '.join(str(line) for line in line_order)}];",
+            "  const nextLine = (line) => {",
+            "    const i = lineOrder.indexOf(line);",
+            "    return i >= 0 && i + 1 < lineOrder.length ? lineOrder[i + 1] : null;",
+            "  };",
+            "  let steps = 0;",
+            "  while (pc !== null) {",
+            "    if (steps >= maxSteps) throw new Error('execution exceeded max steps');",
+            "    steps += 1;",
+            "    const currentLine = pc;",
+            "    try {",
+            "      switch (pc) {",
+        ]
+
+        for line in line_order:
+            js_lines.append(f"        case {line}:")
+            js_lines.extend(js_statement(self.lines[line], line))
+            js_lines.append("          break;")
+
+        js_lines.extend(
+            [
+                "        default:",
+                "          throw new Error(`unknown line ${pc}`);",
+                "      }",
+                "    } catch (err) {",
+                "      if (!errorHandler) throw err;",
+                "      if (errorHandler.mode === 'gosub') resumeLine = nextLine(currentLine);",
+                "      pc = errorHandler.target;",
+                "    }",
+                "    if (stopAfterPrints !== null && output.length >= stopAfterPrints) break;",
+                "  }",
+                "  return { vars, output, pc };",
+                "}",
+            ]
+        )
+        return "\n".join(js_lines)
+
 
 class BasicRuntime:
     def __init__(

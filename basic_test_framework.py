@@ -46,3 +46,8 @@ def hello_bas_line_coverage() -> tuple[int, int, float, list[int]]:
     total = len(all_lines)
     percent = 100.0 if total == 0 else (len(covered) * 100.0 / total)
     return len(covered), total, percent, missing
+
+
+def hello_bas_transpiled_javascript() -> str:
+    program = BasicProgram.from_file(HELLO_BAS)
+    return program.transpile_to_javascript()
