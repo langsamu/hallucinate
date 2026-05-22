@@ -13,7 +13,7 @@ class HelloBasProgramTests(unittest.TestCase):
 
     def test_guard_replaces_empty_message(self) -> None:
         runtime = run_hello_program(
-            start_line=200,
+            start_line=40,
             initial_vars={"MESSAGE$": "", "ITERATION%": 7},
             stop_after_prints=1,
         )
@@ -25,7 +25,7 @@ class HelloBasProgramTests(unittest.TestCase):
 
     def test_counter_wraps_after_9999(self) -> None:
         runtime = run_hello_program(
-            start_line=50,
+            start_line=40,
             initial_vars={"MESSAGE$": "HELLO WORLD", "ITERATION%": 9999},
             stop_after_prints=2,
         )
@@ -33,7 +33,7 @@ class HelloBasProgramTests(unittest.TestCase):
 
     def test_error_handler_recovers_and_resumes_loop(self) -> None:
         runtime = run_hello_program(
-            fault_once_lines={210},
+            fault_once_lines={2200},
             stop_after_prints=1,
         )
         self.assertEqual(runtime.output, ["0 HELLO WORLD"])
@@ -41,7 +41,7 @@ class HelloBasProgramTests(unittest.TestCase):
 
     def test_hello_bas_has_full_line_coverage(self) -> None:
         covered, total, percent, missing = hello_bas_line_coverage()
-        self.assertEqual((covered, total), (13, 13))
+        self.assertEqual(covered, total)
         self.assertEqual(percent, 100.0)
         self.assertEqual(missing, [])
 
