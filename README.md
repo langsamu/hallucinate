@@ -1,27 +1,19 @@
 # hallucinate
 
-```basic
-10 PRINT "HELLO WORLD"
-20 GOTO 10
-```
-
-## Design critique (software design + CS)
-
-- **Strength**: minimal state and constant-time loop body (`O(1)` per iteration).
-- **Weakness**: hard-coded control flow and output string make extension/testing awkward.
-- **Weakness**: no separation of concerns (loop control and output are fused).
-
-## Improvement plan
-
-- Keep the original minimal program as the canonical “goto 10” version.
-- Add a tiny structured variant that isolates output behavior in a subroutine while preserving the infinite-loop vibe.
-
-## Structured variant
+Single-program, enterprise-grade BASIC infinite loop:
 
 ```basic
-10 MESSAGE$ = "HELLO WORLD"
-20 GOSUB 100
-30 GOTO 20
-100 PRINT MESSAGE$
-110 RETURN
+10 REM ENTERPRISE-GRADE HELLO WORLD LOOP
+20 ON ERROR GOTO 900
+30 MESSAGE$ = "HELLO WORLD"
+40 ITERATION% = 0
+50 GOSUB 200
+60 GOTO 50
+200 IF LEN(MESSAGE$) = 0 THEN MESSAGE$ = "HELLO WORLD"
+210 PRINT ITERATION%; " "; MESSAGE$
+220 ITERATION% = ITERATION% + 1
+230 IF ITERATION% > 9999 THEN ITERATION% = 0
+240 RETURN
+900 MESSAGE$ = "HELLO WORLD"
+910 RESUME 50
 ```
