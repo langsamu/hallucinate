@@ -84,25 +84,45 @@ class _OtelManager:
             pass  # graceful degradation: OTel SDK not installed or misconfigured
 
     def start_span(self, name: str) -> None:
-        """Start a new trace span and push it onto the span stack."""
+        """Start a new trace span nested under the current active span.
+
+        Uses the OTel context API so that each new span is automatically
+        a child of the previously started (not-yet-ended) span.  The span
+        is attached to the current context so subsequent OTELSPAN calls
+        see it as their parent.  The detach token is stored alongside the
+        span so end_span can restore the previous context.
+        """
         self._init()
         if self._tracer is None:
-            self._span_stack.append(None)
+            self._span_stack.append((None, None))
             return
         try:
-            span = self._tracer.start_span(name)  # type: ignore[union-attr]
-            self._span_stack.append(span)
+            from opentelemetry import trace, context as otel_context
+            # start_span uses the current context, so it automatically
+            # becomes a child of whatever span is currently active.
+            ctx = otel_context.get_current()
+            span = self._tracer.start_span(name, context=ctx)  # type: ignore[union-attr]
+            # Activate the new span so the next OTELSPAN call nests inside it.
+            token = otel_context.attach(trace.set_span_in_context(span))
+            self._span_stack.append((span, token))
         except Exception:
-            self._span_stack.append(None)
+            self._span_stack.append((None, None))
 
     def end_span(self) -> None:
-        """End the most recently started span (LIFO order)."""
+        """End the most recently started span and restore the previous context."""
         if not self._span_stack:
             return
-        span = self._span_stack.pop()
+        entry = self._span_stack.pop()
+        span, token = entry if isinstance(entry, tuple) else (entry, None)
         if span is not None:
             try:
                 span.end()
+            except Exception:
+                pass
+        if token is not None:
+            try:
+                from opentelemetry import context as otel_context
+                otel_context.detach(token)
             except Exception:
                 pass
 
