@@ -94,76 +94,28 @@ jobs:
           echo "=========================================="
           docker logs otel-collector 2>&1 | tail -50 || true
 
-      - name: Screenshot Jaeger trace
+      - name: Screenshot Jaeger trace and post as PR comment
         # Take a headless-browser screenshot of the Jaeger UI showing the
         # hello-world trace with nested spans.  The screenshot is saved to
-        # screenshots/jaeger-trace.png in the runner workspace.
+        # screenshots/jaeger-trace.png, then uploaded to the PR branch and
+        # posted as an embedded-image PR comment via the GitHub API.
+        #
+        # The posting is done entirely in Python (screenshot_jaeger.py) to
+        # avoid the shell ARG_MAX limit that breaks `gh api -F content=<b64>`
+        # when the PNG exceeds ~128 KB.
+        #
         # Failures here are non-fatal — tests already passed above.
         if: always()
         continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_HEAD_REF: ${{ github.head_ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           pip install playwright requests
           playwright install chromium --with-deps
           python screenshot_jaeger.py
-
-      - name: Publish Jaeger screenshot as PR comment
-        # Upload the screenshot to the PR branch (via GitHub Contents API so
-        # the file gets a guaranteed-fresh commit SHA URL) then post an
-        # embedded-image comment on the pull request.
-        # Only runs on pull_request events where a PR number is available.
-        if: github.event_name == 'pull_request' && always()
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          if [ ! -f screenshots/jaeger-trace.png ]; then
-            echo "No screenshot found — skipping PR comment"
-            exit 0
-          fi
-
-          CONTENT=$(base64 -w 0 screenshots/jaeger-trace.png)
-          REPO="${{ github.repository }}"
-          BRANCH="${{ github.head_ref }}"
-          API_PATH="repos/${REPO}/contents/screenshots/jaeger-trace.png"
-
-          # Create or update the file on the PR branch.
-          EXISTING_SHA=$(gh api "${API_PATH}?ref=${BRANCH}" --jq '.sha' 2>/dev/null || echo "")
-
-          if [ -n "$EXISTING_SHA" ]; then
-            RESPONSE=$(gh api "${API_PATH}" \
-              -X PUT \
-              -F "message=ci: update Jaeger trace screenshot [skip ci]" \
-              -F "content=${CONTENT}" \
-              -F "sha=${EXISTING_SHA}" \
-              -F "branch=${BRANCH}")
-          else
-            RESPONSE=$(gh api "${API_PATH}" \
-              -X PUT \
-              -F "message=ci: add Jaeger trace screenshot [skip ci]" \
-              -F "content=${CONTENT}" \
-              -F "branch=${BRANCH}")
-          fi
-
-          # Build a URL keyed on the new commit SHA so GitHub CDN always
-          # serves the freshly committed file (no stale-cache problem).
-          COMMIT_SHA=$(echo "$RESPONSE" | jq -r '.commit.sha')
-          if [ -z "$COMMIT_SHA" ] || [ "$COMMIT_SHA" = "null" ]; then
-            # Fall back to the branch ref if we couldn't parse the SHA.
-            IMAGE_URL="https://raw.githubusercontent.com/${REPO}/${BRANCH}/screenshots/jaeger-trace.png"
-          else
-            IMAGE_URL="https://raw.githubusercontent.com/${REPO}/${COMMIT_SHA}/screenshots/jaeger-trace.png"
-          fi
-
-          # Build the body as a variable to avoid YAML indentation issues
-          # (bare ! and * at column-0 inside a literal-block scalar break YAML parsing).
-          PR_BODY=$(printf '%s\n\n%s\n\n%s' \
-            '## Jaeger Trace Visualization' \
-            "![hello-world nested spans in Jaeger](${IMAGE_URL})" \
-            '*Trace showing `hello-world-iteration` as the root span with `hello-world-initialize`, `hello-world-guard`, `hello-world-print`, and `hello-world-advance` as nested child spans.*')
-
-          gh pr comment "${{ github.event.pull_request.number }}" \
-            --repo "${REPO}" \
-            --body "${PR_BODY}"
 
       - name: Stop OTel Collector and Jaeger, list signal files
         if: always()
