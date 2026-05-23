@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import json
+import queue
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import textwrap
+import threading
+import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -52,8 +58,12 @@ class _OtelManager:
             from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
             from opentelemetry._logs import set_logger_provider
             from opentelemetry.sdk.resources import Resource
+            import os as _os  # noqa: PLC0415
 
-            resource = Resource.create({"service.name": "hello-bas"})
+            # Allow per-container service names for distributed tracing so that
+            # coordinator, worker-1, worker-2 etc. show as separate services in Jaeger.
+            service_name = _os.environ.get("OTEL_SERVICE_NAME", "hello-bas")
+            resource = Resource.create({"service.name": service_name})
 
             # --- Traces ---
             tracer_provider = TracerProvider(resource=resource)
@@ -184,6 +194,219 @@ class _OtelManager:
 _OTEL = _OtelManager()
 
 
+class _HttpServer:
+    """Per-port HTTP server factory for BASIC HTTPSERVE / HTTPRESPOND.
+
+    Each port gets its own pair of queues (request_queue, response_queue) so
+    that multiple BASIC programs can serve on different ports concurrently.
+    The server threads are daemon threads so they exit when the process does.
+
+    BASIC usage pattern (sequential blocking event-loop):
+        HTTPSERVE 8080      <- blocks until a request arrives; sets HTTP_VERB$,
+                               HTTP_PATH$, HTTP_BODY$ in the calling runtime
+        ...process request...
+        HTTPRESPOND 200, R$ <- sends the response to the waiting HTTP client
+        GOTO previous line  <- loop back to accept next request
+    """
+
+    def __init__(self) -> None:
+        # RLock allows the same thread to re-acquire (avoids deadlock when
+        # _start_server calls helpers that also acquire the lock).
+        self._lock = threading.RLock()
+        self._servers: dict[int, object] = {}
+        self._queues: dict[int, tuple[queue.Queue, queue.Queue]] = {}
+
+    def _get_or_create_queues(self, port: int) -> tuple[queue.Queue, queue.Queue]:
+        """Return the (req_q, resp_q) pair for *port*, creating it if needed.
+
+        Caller MUST NOT hold self._lock when calling this method (or must
+        hold it reentrant-safely via RLock).
+        """
+        with self._lock:
+            if port not in self._queues:
+                self._queues[port] = (queue.Queue(), queue.Queue())
+            return self._queues[port]
+
+    def _start_server(self, port: int) -> None:
+        """Start a background HTTP server on *port* if not already running."""
+        with self._lock:
+            if port in self._servers:
+                return
+            # Queues are created here (inside the lock) without a nested
+            # lock acquisition — direct dict access avoids the deadlock.
+            if port not in self._queues:
+                self._queues[port] = (queue.Queue(), queue.Queue())
+            req_q, resp_q = self._queues[port]
+
+        # Build the handler class OUTSIDE the lock so it can capture the
+        # queues freely without risking any secondary lock acquisition.
+        rq = req_q
+        rsq = resp_q
+
+        from http.server import BaseHTTPRequestHandler, HTTPServer  # noqa: PLC0415
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_args: object) -> None:
+                pass  # silence access log
+
+            def _dispatch(self) -> None:
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                body = (self.rfile.read(length).decode("utf-8", errors="replace")
+                        if length > 0 else "")
+                # Extract OTel W3C trace-context so incoming spans link correctly.
+                try:
+                    from opentelemetry.propagate import extract as _ex  # noqa: PLC0415
+                    from opentelemetry import context as _ctx  # noqa: PLC0415
+                    _ctx.attach(_ex({k: v for k, v in self.headers.items()}))
+                except Exception:
+                    pass
+                rq.put((self.command, self.path, body))
+                status, resp_body = rsq.get()
+                resp_bytes = resp_body.encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(resp_bytes)))
+                self.end_headers()
+                self.wfile.write(resp_bytes)
+
+            def do_GET(self) -> None: self._dispatch()   # noqa: E301
+            def do_POST(self) -> None: self._dispatch()  # noqa: E301
+            def do_HEAD(self) -> None: self._dispatch()  # noqa: E301
+
+        server = HTTPServer(("", port), Handler)
+        with self._lock:
+            # Double-check: another thread might have started the server while
+            # we were building the handler class outside the lock.
+            if port not in self._servers:
+                t = threading.Thread(target=server.serve_forever, daemon=True)
+                t.start()
+                self._servers[port] = server
+
+    def accept(self, port: int) -> tuple[str, str, str]:
+        """Block until an HTTP request arrives on *port*.
+
+        Returns ``(verb, path, body)`` and leaves the response slot open until
+        :meth:`respond` is called.
+        """
+        self._start_server(port)
+        req_q, _ = self._get_or_create_queues(port)
+        return req_q.get()
+
+    def respond(self, port: int, status: int, body: str) -> None:
+        """Send *body* with HTTP *status* to the client waiting on *port*."""
+        _, resp_q = self._get_or_create_queues(port)
+        resp_q.put((status, body))
+
+    def port_is_listening(self, port: int) -> bool:
+        """Return True if *port* has a server accepting connections."""
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                return True
+        except OSError:
+            return False
+
+
+# Module-level HTTP server singleton — shared so spawned BASIC programs can
+# each serve on their own port without interfering with each other.
+_HTTP_SERVER = _HttpServer()
+
+# Registry of spawned BasicRuntime instances, keyed by filename, so that
+# COVCNT / JCOVCNT can credit their executed lines to the coverage totals.
+_SPAWNED: dict[str, "BasicRuntime"] = {}
+
+
+def _top_level_plus_split(expr: str) -> tuple[str, str] | None:
+    """Split *expr* at the first ``+`` that is not inside parentheses or a
+    double-quoted string literal.
+
+    Returns ``(left, right)`` (both un-stripped) or ``None`` if no such ``+``
+    exists.  This is the correct way to parse the ``+`` operator in BASIC
+    expressions because function arguments may themselves contain ``+``
+    (e.g. ``INSTR(A$, "x=" + B$)``).
+    """
+    depth = 0
+    in_str = False
+    for i, ch in enumerate(expr):
+        if ch == '"' and not in_str:
+            in_str = True
+        elif ch == '"' and in_str:
+            in_str = False
+        elif not in_str:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            elif ch == "+" and depth == 0:
+                return expr[:i], expr[i + 1:]
+    return None
+
+
+def _match_func_call(expr: str, name: str) -> str | None:
+    """If *expr* is exactly a call to function *name* with balanced parentheses,
+    return the argument string (everything between the outer parens).
+
+    Returns ``None`` if the expression is not a complete call to *name* — e.g.
+    if there is content after the closing paren, meaning the *expr* is actually
+    a subexpression within a larger ``+`` chain (which the caller must handle
+    with ``_top_level_plus_split`` first).
+
+    Example:
+        _match_func_call('STR$(X%+1)', 'STR$') -> 'X%+1'
+        _match_func_call('STR$(X%) + "foo"', 'STR$') -> None  (trailing content)
+    """
+    prefix = name + "("
+    if not expr.startswith(prefix):
+        return None
+    depth = 0
+    in_str = False
+    for i in range(len(prefix) - 1, len(expr)):
+        ch = expr[i]
+        if ch == '"' and not in_str:
+            in_str = True
+        elif ch == '"' and in_str:
+            in_str = False
+        elif not in_str:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    if i == len(expr) - 1:
+                        return expr[len(prefix):i]
+                    return None  # trailing content — not a simple call
+    return None  # unbalanced parens
+
+
+def _http_request(method: str, url: str, body: str = "") -> tuple[int, str]:
+    """Make a simple HTTP/HTTPS request and return (status_code, response_body).
+
+    Used by the BASIC HTTPPOST and HTTPGET instructions.  Automatically
+    injects OTel trace-context propagation headers so distributed traces
+    link coordinator spans to worker spans in Jaeger.
+    """
+    headers: dict[str, str] = {"Content-Type": "application/x-www-form-urlencoded"}
+    # Inject W3C traceparent / tracestate so cross-service spans are linked.
+    try:
+        from opentelemetry.propagate import inject as _inject  # noqa: PLC0415
+        _inject(headers)
+    except Exception:
+        pass
+    data = body.encode("utf-8") if body else None
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    # Accept self-signed TLS certificates (used in the CI nginx TLS terminator).
+    import ssl  # noqa: PLC0415
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+            return resp.status, resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+        return 0, str(exc)
+
+
 @dataclass
 class BasicProgram:
     lines: dict[int, str]
@@ -210,17 +433,71 @@ class BasicProgram:
 
         def js_expr(expr: str) -> str:
             expr = expr.strip()
-            if expr.startswith('"') and expr.endswith('"'):
-                return expr
+            # String literal: outer quotes with no inner quotes (BASIC has no escape).
+            if expr.startswith('"') and expr.endswith('"') and len(expr) >= 2:
+                if '"' not in expr[1:-1]:
+                    return expr
             if expr.isdigit():
                 return expr
-            if "+" in expr:
-                left, right = expr.split("+", 1)
-                return f"(Number({js_expr(left)}) + Number({js_expr(right)}))"
-            len_match = re.fullmatch(r"LEN\(([^)]+)\)", expr)
-            if len_match:
-                inner = len_match.group(1).strip()
-                return f"(String({js_var(inner)} ?? '')).length"
+
+            # STR$(expr) — integer to string
+            arg = _match_func_call(expr, "STR$")
+            if arg is not None:
+                return f"String(Number({js_expr(arg.strip())}))"
+
+            # VAL(str$) — string to integer
+            arg = _match_func_call(expr, "VAL")
+            if arg is not None:
+                return f"(parseInt(String({js_expr(arg.strip())})) || 0)"
+
+            # MID$(str$, start%, len%)
+            arg = _match_func_call(expr, "MID$")
+            if arg is not None:
+                parts = [p.strip() for p in arg.split(",", 2)]
+                if len(parts) == 3:
+                    s, start, length = js_expr(parts[0]), js_expr(parts[1]), js_expr(parts[2])
+                    return f"(String({s}).substring(Number({start})-1, Number({start})-1+Number({length})))"
+
+            # INSTR(haystack, needle) — 1-based position or 0
+            arg = _match_func_call(expr, "INSTR")
+            if arg is not None:
+                comma_pos = None
+                depth_i, in_str_i = 0, False
+                for ci, ch2 in enumerate(arg):
+                    if ch2 == '"' and not in_str_i:
+                        in_str_i = True
+                    elif ch2 == '"' and in_str_i:
+                        in_str_i = False
+                    elif not in_str_i:
+                        if ch2 == "(":
+                            depth_i += 1
+                        elif ch2 == ")":
+                            depth_i -= 1
+                        elif ch2 == "," and depth_i == 0:
+                            comma_pos = ci
+                            break
+                if comma_pos is not None:
+                    h = js_expr(arg[:comma_pos].strip())
+                    n = js_expr(arg[comma_pos + 1:].strip())
+                    return f"((String({h}).indexOf(String({n})) + 1))"
+
+            # LEN(var$)
+            arg = _match_func_call(expr, "LEN")
+            if arg is not None:
+                return f"(String({js_var(arg.strip())} ?? '')).length"
+
+            # + operator: use JS string concat when either side is a string type.
+            # Use top-level split to avoid splitting inside function args.
+            split_res = _top_level_plus_split(expr)
+            if split_res is not None:
+                left, right = split_res
+                lv = js_expr(left)
+                rv = js_expr(right)
+                if left.strip().endswith("$") or right.strip().endswith("$") \
+                        or left.strip().startswith('"') or right.strip().startswith('"'):
+                    return f"(String({lv}) + String({rv}))"
+                return f"(Number({lv}) + Number({rv}))"
+
             if expr.endswith("%"):
                 return f"({js_var(expr)} ?? 0)"
             if expr.endswith("$"):
@@ -325,6 +602,21 @@ class BasicProgram:
                     f"{indent}// otel (no-op in js): {statement}",
                     f"{indent}pc = {js_next_line(line)};",
                 ]
+            # HTTP/network and SLEEP/SPAWN instructions are no-ops in the
+            # transpiled JS path (JS has no BASIC networking runtime).  They
+            # emit descriptive comments so the generated source stays readable.
+            if (
+                statement.startswith("HTTPPOST ")
+                or statement.startswith("HTTPGET ")
+                or statement.startswith("HTTPSERVE ")
+                or statement.startswith("HTTPRESPOND ")
+                or statement.startswith("SLEEP ")
+                or statement.startswith("SPAWN ")
+            ):
+                return [
+                    f"{indent}// network (no-op in js): {statement}",
+                    f"{indent}pc = {js_next_line(line)};",
+                ]
             raise RuntimeError(f"unsupported statement for transpilation: {statement}")
 
         js_lines: list[str] = [
@@ -409,6 +701,8 @@ class BasicRuntime:
         # Coverage stores: accumulated executed lines per filename across RUNBASIC/NODERUN calls.
         self._bas_coverage: dict[str, set[int]] = {}
         self._js_coverage: dict[str, set[int]] = {}
+        # Current port being served (set by HTTPSERVE, read by HTTPRESPOND).
+        self._current_serve_port: int = 8080
 
     def run(
         self,
@@ -598,37 +892,173 @@ class BasicRuntime:
             self.pc = self._next_line(self.pc)
             return
 
+        # ---- Distributed networking instructions ----------------------------
+        # HTTPPOST url$, body$  — HTTP POST; sets HTTP_STATUS%, HTTP_BODY$
+        # HTTPGET  url$         — HTTP GET;  sets HTTP_STATUS%, HTTP_BODY$
+        # HTTPSERVE port%       — blocks until a request arrives; sets
+        #                         HTTP_VERB$, HTTP_PATH$, HTTP_BODY$
+        # HTTPRESPOND code%, body$ — sends the response for the pending request
+        # SLEEP ms%             — pause execution for the given milliseconds
+        # SPAWN "prog.bas"      — run a BASIC program as a background service;
+        #                         reads _SPORT% for the port to wait on
+
+        if statement.startswith("HTTPPOST "):
+            rest = statement[len("HTTPPOST "):].strip()
+            url_expr, body_expr = rest.split(",", 1)
+            url = str(self._eval_expr(url_expr.strip()))
+            body = str(self._eval_expr(body_expr.strip()))
+            status, response = _http_request("POST", url, body)
+            self.vars["HTTP_STATUS%"] = status
+            self.vars["HTTP_BODY$"] = response
+            self.pc = self._next_line(self.pc)
+            return
+
+        if statement.startswith("HTTPGET "):
+            url = str(self._eval_expr(statement[len("HTTPGET "):].strip()))
+            status, response = _http_request("GET", url)
+            self.vars["HTTP_STATUS%"] = status
+            self.vars["HTTP_BODY$"] = response
+            self.pc = self._next_line(self.pc)
+            return
+
+        if statement.startswith("HTTPSERVE "):
+            port = int(self._eval_expr(statement[len("HTTPSERVE "):].strip()))
+            self._current_serve_port = port
+            verb, path, body = _HTTP_SERVER.accept(port)
+            self.vars["HTTP_VERB$"] = verb
+            self.vars["HTTP_PATH$"] = path
+            self.vars["HTTP_BODY$"] = body
+            self.pc = self._next_line(self.pc)
+            return
+
+        if statement.startswith("HTTPRESPOND "):
+            rest = statement[len("HTTPRESPOND "):].strip()
+            code_expr, body_expr = rest.split(",", 1)
+            code = int(self._eval_expr(code_expr.strip()))
+            body = str(self._eval_expr(body_expr.strip()))
+            port = getattr(self, "_current_serve_port", 8080)
+            _HTTP_SERVER.respond(port, code, body)
+            self.pc = self._next_line(self.pc)
+            return
+
+        if statement.startswith("SLEEP "):
+            ms = int(self._eval_expr(statement[len("SLEEP "):].strip()))
+            time.sleep(ms / 1000.0)
+            self.pc = self._next_line(self.pc)
+            return
+
+        if statement.startswith('SPAWN "') and statement.endswith('"'):
+            self._exec_spawn(statement[len('SPAWN "'):-1])
+            return
+
         raise RuntimeError(f"unsupported statement: {statement}")
 
     def _eval_condition(self, text: str) -> bool:
+        # Check multi-char operators first (longest-match).
         if " <> " in text:
             left, right = text.split(" <> ", 1)
             return self._eval_expr(left.strip()) != self._eval_expr(right.strip())
+        if " >= " in text:
+            left, right = text.split(" >= ", 1)
+            return int(self._eval_expr(left.strip())) >= int(self._eval_expr(right.strip()))
+        if " <= " in text:
+            left, right = text.split(" <= ", 1)
+            return int(self._eval_expr(left.strip())) <= int(self._eval_expr(right.strip()))
         if " > " in text:
             left, right = text.split(" > ", 1)
             return int(self._eval_expr(left.strip())) > int(self._eval_expr(right.strip()))
+        if " < " in text:
+            left, right = text.split(" < ", 1)
+            return int(self._eval_expr(left.strip())) < int(self._eval_expr(right.strip()))
         if " = " in text:
             left, right = text.split(" = ", 1)
             return self._eval_expr(left.strip()) == self._eval_expr(right.strip())
         raise RuntimeError(f"unsupported condition: {text}")
 
     def _eval_expr(self, expr: str) -> int | str:
-        if expr.startswith('"') and expr.endswith('"'):
-            return expr[1:-1]
+        # String literal: starts and ends with " and has no inner " chars
+        # (classic BASIC strings have no escape mechanism).
+        if expr.startswith('"') and expr.endswith('"') and len(expr) >= 2:
+            inner = expr[1:-1]
+            if '"' not in inner:
+                return inner
         if expr.isdigit():
             return int(expr)
-        if "+" in expr:
-            left, right = expr.split("+", 1)
-            return int(self._eval_expr(left.strip())) + int(self._eval_expr(right.strip()))
-        len_match = re.fullmatch(r"LEN\(([^)]+)\)", expr)
-        if len_match:
-            inner = len_match.group(1).strip()
-            return len(str(self.vars.get(inner, "")))
-        instr_match = re.fullmatch(r"INSTR\(([^,]+),\s*(.+)\)", expr)
-        if instr_match:
-            haystack = str(self._eval_expr(instr_match.group(1).strip()))
-            needle = str(self._eval_expr(instr_match.group(2).strip()))
-            return 1 if needle in haystack else 0
+
+        # ---- Standard BASIC string functions (minimal additions) -------------
+        # These are checked BEFORE the + operator so that function arguments
+        # that themselves contain + (e.g. INSTR(A$, "x=" + B$)) are parsed
+        # correctly rather than split at the inner +.
+        # _match_func_call ensures we only match a COMPLETE call (no trailing
+        # content), so STR$(X%) in "STR$(X%) + Y$" is NOT matched here —
+        # instead it falls through to _top_level_plus_split.
+
+        # STR$(expr) — convert integer to its decimal string
+        arg = _match_func_call(expr, "STR$")
+        if arg is not None:
+            return str(int(self._eval_expr(arg.strip())))
+
+        # VAL(str$) — convert leading digits of string to integer
+        arg = _match_func_call(expr, "VAL")
+        if arg is not None:
+            raw = str(self._eval_expr(arg.strip())).lstrip()
+            m = re.match(r"^-?\d+", raw)
+            return int(m.group()) if m else 0
+
+        # MID$(str$, start%, len%) — n chars at 1-based position
+        arg = _match_func_call(expr, "MID$")
+        if arg is not None:
+            # Split arg on commas at the top level of the MID$ call.
+            parts = [p.strip() for p in arg.split(",", 2)]
+            if len(parts) == 3:
+                s = str(self._eval_expr(parts[0]))
+                start = max(0, int(self._eval_expr(parts[1])) - 1)
+                length = int(self._eval_expr(parts[2]))
+                return s[start: start + length]
+
+        # LEN(var$)
+        arg = _match_func_call(expr, "LEN")
+        if arg is not None:
+            return len(str(self.vars.get(arg.strip(), "")))
+
+        # INSTR(haystack$, needle$) — 1-based position, 0 if not found
+        arg = _match_func_call(expr, "INSTR")
+        if arg is not None:
+            # Split on the first comma at the top level of the INSTR args.
+            split = _top_level_plus_split(arg.replace(",", "+", 1))
+            # Use a dedicated top-level-comma split instead.
+            comma_pos = None
+            depth2, in_str2 = 0, False
+            for ci, ch2 in enumerate(arg):
+                if ch2 == '"' and not in_str2:
+                    in_str2 = True
+                elif ch2 == '"' and in_str2:
+                    in_str2 = False
+                elif not in_str2:
+                    if ch2 == "(":
+                        depth2 += 1
+                    elif ch2 == ")":
+                        depth2 -= 1
+                    elif ch2 == "," and depth2 == 0:
+                        comma_pos = ci
+                        break
+            if comma_pos is not None:
+                haystack = str(self._eval_expr(arg[:comma_pos].strip()))
+                needle = str(self._eval_expr(arg[comma_pos + 1:].strip()))
+                pos = haystack.find(needle)
+                return (pos + 1) if pos >= 0 else 0
+
+        # ---- + operator: arithmetic or string concatenation ----------------
+        # Split only at a top-level + so nested function args are preserved.
+        spl = _top_level_plus_split(expr)
+        if spl is not None:
+            left, right = spl
+            lv = self._eval_expr(left.strip())
+            rv = self._eval_expr(right.strip())
+            if isinstance(lv, str) or isinstance(rv, str):
+                return str(lv) + str(rv)
+            return int(lv) + int(rv)
+
         if expr in self.vars:
             return self.vars[expr]
         if expr.endswith("%"):
@@ -764,9 +1194,16 @@ class BasicRuntime:
         self.pc = self._next_line(self.pc)
 
     def _exec_covcnt(self, filename: str) -> None:
-        """Read accumulated BASIC coverage for a file into B_COVC% and B_TOTL%."""
+        """Read accumulated BASIC coverage for a file into B_COVC% and B_TOTL%.
+
+        Also includes lines executed by a SPAWN-ed runtime for *filename* so
+        that coverage of long-running server programs (e.g. coordinator.bas)
+        is visible even though they never exit.
+        """
         prog = BasicProgram.from_file(Path(filename))
-        covered = self._bas_coverage.get(filename, set())
+        covered = set(self._bas_coverage.get(filename, set()))
+        if filename in _SPAWNED:
+            covered.update(_SPAWNED[filename].executed_lines)
         self.vars["B_COVC%"] = len(covered)
         self.vars["B_TOTL%"] = len(prog.lines)
         self.pc = self._next_line(self.pc)
@@ -778,3 +1215,39 @@ class BasicRuntime:
         self.vars["J_COVC%"] = len(covered)
         self.vars["J_TOTL%"] = len(prog.lines)
         self.pc = self._next_line(self.pc)
+
+    def _exec_spawn(self, filename: str) -> None:
+        """Start a BASIC program as a background daemon service.
+
+        The program runs in a daemon thread (exits when the process does) and
+        accumulates line coverage in the module-level _SPAWNED registry so
+        COVCNT can report it.
+
+        _SPORT% (read from the calling program's variables) specifies a TCP
+        port to wait on before returning.  If _SPORT% = 0 (or absent) the
+        instruction returns immediately after starting the thread.
+        """
+        prog = BasicProgram.from_file(Path(filename))
+        rt = BasicRuntime(prog)
+        _SPAWNED[filename] = rt
+
+        def _run() -> None:
+            try:
+                rt.run(max_steps=50_000_000)
+            except Exception:
+                pass  # background service exit is silent
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+
+        # Optionally wait until the specified port is accepting connections.
+        port = int(self.vars.get("_SPORT%", 0))
+        if port > 0:
+            deadline = time.time() + 10.0
+            while time.time() < deadline:
+                if _HTTP_SERVER.port_is_listening(port):
+                    break
+                time.sleep(0.05)
+
+        self.pc = self._next_line(self.pc)
+

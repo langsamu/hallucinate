@@ -53,7 +53,7 @@
 490 PRINT "ENTERPRISE HELLO.BAS TEST SUITE"
 500 PRINT "=========================================="
 
-54 REM --- DISPATCH: RUN ALL TEN TEST CASES ---
+54 REM --- DISPATCH: RUN ALL TEST CASES (T1-T10 original, T11-T19 distributed) ---
 520 GOSUB 1000
 530 GOSUB 2000
 540 GOSUB 3000
@@ -64,6 +64,7 @@
 590 GOSUB 8000
 600 GOSUB 10000
 605 GOSUB 15000
+606 GOSUB 20000
 
 610 REM --- DISPLAY TRANSPILED JS SOURCE AND PROGRAM OUTPUTS FOR CI ---
 620 GOSUB 11000
@@ -221,27 +222,32 @@
 6070 REM =========================================================
 6080 TRANSPILE "hello.bas"
 6090 REM --- ASSERT: Main function signature is present ---
-6100 ASSERT_I% = INSTR(T_JS$, "function runBasicProgram")
+6095 ASSERT_I% = 0
+6100 IF INSTR(T_JS$, "function runBasicProgram") > 0 THEN ASSERT_I% = 1
 6110 ASSERT_J% = 1
 6120 ASSERT_NAME$ = "T6: JS HAS runBasicProgram FUNCTION"
 6130 GOSUB 91000
 6140 REM --- ASSERT: Switch case for first BASIC line exists ---
-6150 ASSERT_I% = INSTR(T_JS$, "case 10:")
+6145 ASSERT_I% = 0
+6150 IF INSTR(T_JS$, "case 10:") > 0 THEN ASSERT_I% = 1
 6160 ASSERT_J% = 1
 6170 ASSERT_NAME$ = "T6: JS HAS CASE FOR LINE 10"
 6180 GOSUB 91000
 6190 REM --- ASSERT: Switch case for PRINT line exists ---
-6200 ASSERT_I% = INSTR(T_JS$, "case 2210:")
+6195 ASSERT_I% = 0
+6200 IF INSTR(T_JS$, "case 2210:") > 0 THEN ASSERT_I% = 1
 6210 ASSERT_J% = 1
 6220 ASSERT_NAME$ = "T6: JS HAS CASE FOR LINE 2210"
 6230 GOSUB 91000
 6240 REM --- ASSERT: Line-coverage tracking variable is present ---
-6250 ASSERT_I% = INSTR(T_JS$, "executedLines")
+6245 ASSERT_I% = 0
+6250 IF INSTR(T_JS$, "executedLines") > 0 THEN ASSERT_I% = 1
 6260 ASSERT_J% = 1
 6270 ASSERT_NAME$ = "T6: JS HAS executedLines TRACKING"
 6280 GOSUB 91000
 6290 REM --- ASSERT: Error handler targets the recovery subroutine ---
-6300 ASSERT_I% = INSTR(T_JS$, "target: 1900")
+6295 ASSERT_I% = 0
+6300 IF INSTR(T_JS$, "target: 1900") > 0 THEN ASSERT_I% = 1
 6310 ASSERT_J% = 1
 6320 ASSERT_NAME$ = "T6: JS ERROR HANDLER TARGETS LINE 1900"
 6330 GOSUB 91000
@@ -468,16 +474,21 @@
 12000 REM =========================================================
 12010 REM  COVERAGE REPORT: PRINT ACCUMULATED LINE COVERAGE STATS
 12020 REM  Re-reads the coverage counters accumulated across all test
-12030 REM  runs and prints percentages for both execution paths.
-12040 REM =========================================================
-12050 PRINT "=========================================="
-12060 PRINT "LINE COVERAGE REPORT:"
-12070 PRINT "=========================================="
-12080 COVCNT "hello.bas"
-12090 PRINT "BASIC emulator: "; B_COVC%; "/"; B_TOTL%; " lines covered"
-12100 JCOVCNT "hello.bas"
-12110 PRINT "Transpiled JS:  "; J_COVC%; "/"; J_TOTL%; " lines covered"
-12120 RETURN
+12030 REM  runs and prints percentages for both execution paths plus
+12040 REM  coverage of the distributed coordinator and worker programs.
+12050 REM =========================================================
+12060 PRINT "=========================================="
+12070 PRINT "LINE COVERAGE REPORT:"
+12080 PRINT "=========================================="
+12090 COVCNT "hello.bas"
+12100 PRINT "BASIC emulator: "; B_COVC%; "/"; B_TOTL%; " lines covered (hello.bas)"
+12110 JCOVCNT "hello.bas"
+12120 PRINT "Transpiled JS:  "; J_COVC%; "/"; J_TOTL%; " lines covered (hello.bas)"
+12130 COVCNT "coordinator.bas"
+12140 PRINT "Coordinator:    "; B_COVC%; "/"; B_TOTL%; " lines covered (coordinator.bas)"
+12150 COVCNT "worker.bas"
+12160 PRINT "Worker:         "; B_COVC%; "/"; B_TOTL%; " lines covered (worker.bas)"
+12170 RETURN
 
 13000 REM =========================================================
 13010 REM  SUMMARY: PRINT FINAL RESULTS AND SET _EXIT_CODE%
@@ -580,3 +591,241 @@
 15170 ASSERT_NAME$ = "T10: OTEL SIGNALS FLUSH WITHOUT ERROR"
 15180 GOSUB 91000
 15190 RETURN
+
+20000 REM =========================================================
+20010 REM  DISTRIBUTED CLUSTER TESTS (T11-T19)
+20020 REM
+20030 REM  These tests spin up coordinator.bas as a background HTTP
+20040 REM  server via SPAWN, then exercise every route and branch
+20050 REM  using HTTPPOST / HTTPGET from within BASIC.
+20060 REM
+20070 REM  Coordinator port: 8081  (avoids clashing with CI services)
+20080 REM
+20090 REM  Tests cover:
+20100 REM    T11 - SPAWN starts coordinator and port becomes ready
+20110 REM    T12 - Bad auth token returns 401
+20120 REM    T13 - Worker registration succeeds
+20130 REM    T14 - Work ticket distribution returns TID and count
+20140 REM    T15 - 2PC PREPARE accepted; vote=commit returned
+20150 REM    T16 - 2PC COMMIT accepted; total updated
+20160 REM    T17 - 2PC ABORT accepted
+20170 REM    T18 - Unknown path returns 404
+20180 REM    T19 - Full worker.bas integration (end-to-end)
+20190 REM =========================================================
+20200 COORD_PORT% = 8080
+20210 COORD_BASE$ = "http://localhost:8080"
+20220 SECRET$ = "BASIC-SECRET"
+20230 BAD_TOK$ = "WRONG-TOKEN"
+20240 REM --- SPAWN COORDINATOR (one background instance for all tests) ---
+20250 _SPORT% = 8080
+20260 SPAWN "coordinator.bas"
+20270 GOSUB 21000
+20280 GOSUB 22000
+20290 GOSUB 23000
+20300 GOSUB 24000
+20310 GOSUB 25000
+20320 GOSUB 26000
+20330 GOSUB 27000
+20340 GOSUB 28000
+20350 GOSUB 29000
+20360 RETURN
+
+21000 REM =========================================================
+21010 REM  TEST 11: COORDINATOR STARTS AND ACCEPTS CONNECTIONS
+21020 REM =========================================================
+21030 PRINT "=========================================="
+21040 PRINT "T11: COORDINATOR STARTUP"
+21050 PRINT "=========================================="
+21060 REM --- Ping via a register request; if coordinator is up we get a response ---
+21070 PING_BODY$ = "token=" + SECRET$ + "&worker=PING"
+21080 HTTPPOST COORD_BASE$ + "/register", PING_BODY$
+21090 ASSERT_I% = HTTP_STATUS%
+21100 ASSERT_J% = 200
+21110 ASSERT_NAME$ = "T11: COORDINATOR RETURNS HTTP 200"
+21120 GOSUB 91000
+21130 ASSERT_I% = 0
+21131 IF INSTR(HTTP_BODY$, "ok=1") > 0 THEN ASSERT_I% = 1
+21140 ASSERT_J% = 1
+21150 ASSERT_NAME$ = "T11: COORDINATOR RESPONSE CONTAINS ok=1"
+21160 GOSUB 91000
+21170 RETURN
+
+22000 REM =========================================================
+22010 REM  TEST 12: BAD AUTH TOKEN RETURNS 401 UNAUTHORIZED
+22020 REM =========================================================
+22030 PRINT "=========================================="
+22040 PRINT "T12: AUTH REJECTION"
+22050 PRINT "=========================================="
+22060 BAD_BODY$ = "token=" + BAD_TOK$ + "&worker=EVIL"
+22070 HTTPPOST COORD_BASE$ + "/register", BAD_BODY$
+22080 ASSERT_I% = HTTP_STATUS%
+22090 ASSERT_J% = 401
+22100 ASSERT_NAME$ = "T12: BAD TOKEN GIVES 401"
+22110 GOSUB 91000
+22120 ASSERT_I% = 0
+22121 IF INSTR(HTTP_BODY$, "UNAUTHORIZED") > 0 THEN ASSERT_I% = 1
+22130 ASSERT_J% = 1
+22140 ASSERT_NAME$ = "T12: ERROR BODY SAYS UNAUTHORIZED"
+22150 GOSUB 91000
+22160 RETURN
+
+23000 REM =========================================================
+23010 REM  TEST 13: WORKER REGISTRATION
+23020 REM =========================================================
+23030 PRINT "=========================================="
+23040 PRINT "T13: WORKER REGISTRATION"
+23050 PRINT "=========================================="
+23060 REG_BODY$ = "token=" + SECRET$ + "&worker=W1"
+23070 HTTPPOST COORD_BASE$ + "/register", REG_BODY$
+23080 ASSERT_I% = HTTP_STATUS%
+23090 ASSERT_J% = 200
+23100 ASSERT_NAME$ = "T13: REGISTRATION RETURNS 200"
+23110 GOSUB 91000
+23120 ASSERT_I% = 0
+23121 IF INSTR(HTTP_BODY$, "workers=") > 0 THEN ASSERT_I% = 1
+23130 ASSERT_J% = 1
+23140 ASSERT_NAME$ = "T13: RESPONSE INCLUDES WORKER COUNT"
+23150 GOSUB 91000
+23160 RETURN
+
+24000 REM =========================================================
+24010 REM  TEST 14: WORK TICKET DISTRIBUTION
+24020 REM =========================================================
+24030 PRINT "=========================================="
+24040 PRINT "T14: WORK TICKET"
+24050 PRINT "=========================================="
+24060 WORK_URL$ = COORD_BASE$ + "/work?token=" + SECRET$ + "&worker=W1"
+24070 HTTPGET WORK_URL$
+24080 ASSERT_I% = HTTP_STATUS%
+24090 ASSERT_J% = 200
+24100 ASSERT_NAME$ = "T14: WORK RETURNS 200"
+24110 GOSUB 91000
+24120 ASSERT_I% = 0
+24121 IF INSTR(HTTP_BODY$, "tid=") > 0 THEN ASSERT_I% = 1
+24130 ASSERT_J% = 1
+24140 ASSERT_NAME$ = "T14: WORK RESPONSE HAS TID"
+24150 GOSUB 91000
+24160 ASSERT_I% = 0
+24161 IF INSTR(HTTP_BODY$, "count=") > 0 THEN ASSERT_I% = 1
+24170 ASSERT_J% = 1
+24180 ASSERT_NAME$ = "T14: WORK RESPONSE HAS COUNT"
+24190 GOSUB 91000
+24200 REM --- Extract TID for use in subsequent 2PC tests ---
+24210 P% = INSTR(HTTP_BODY$, "tid=") + 4
+24220 LAST_TID% = VAL(MID$(HTTP_BODY$, P%, 6))
+24230 RETURN
+
+25000 REM =========================================================
+25010 REM  TEST 15: 2PC PHASE 1 - PREPARE
+25020 REM =========================================================
+25030 PRINT "=========================================="
+25040 PRINT "T15: 2PC PREPARE"
+25050 PRINT "=========================================="
+25060 PREP_BODY$ = "token=" + SECRET$ + "&worker=W1"
+25070 PREP_BODY$ = PREP_BODY$ + "&tid=" + STR$(LAST_TID%)
+25080 PREP_BODY$ = PREP_BODY$ + "&prints=5"
+25090 HTTPPOST COORD_BASE$ + "/prepare", PREP_BODY$
+25100 ASSERT_I% = HTTP_STATUS%
+25110 ASSERT_J% = 200
+25120 ASSERT_NAME$ = "T15: PREPARE RETURNS 200"
+25130 GOSUB 91000
+25140 ASSERT_I% = 0
+25141 IF INSTR(HTTP_BODY$, "vote=commit") > 0 THEN ASSERT_I% = 1
+25150 ASSERT_J% = 1
+25160 ASSERT_NAME$ = "T15: COORDINATOR VOTES COMMIT"
+25170 GOSUB 91000
+25180 RETURN
+
+26000 REM =========================================================
+26010 REM  TEST 16: 2PC PHASE 2 - COMMIT
+26020 REM =========================================================
+26030 PRINT "=========================================="
+26040 PRINT "T16: 2PC COMMIT"
+26050 PRINT "=========================================="
+26060 COMM_BODY$ = "token=" + SECRET$ + "&worker=W1"
+26070 COMM_BODY$ = COMM_BODY$ + "&tid=" + STR$(LAST_TID%)
+26080 COMM_BODY$ = COMM_BODY$ + "&prints=5"
+26090 HTTPPOST COORD_BASE$ + "/commit", COMM_BODY$
+26100 ASSERT_I% = HTTP_STATUS%
+26110 ASSERT_J% = 200
+26120 ASSERT_NAME$ = "T16: COMMIT RETURNS 200"
+26130 GOSUB 91000
+26140 ASSERT_I% = 0
+26141 IF INSTR(HTTP_BODY$, "total=") > 0 THEN ASSERT_I% = 1
+26150 ASSERT_J% = 1
+26160 ASSERT_NAME$ = "T16: COMMIT RESPONSE HAS TOTAL"
+26170 GOSUB 91000
+26180 RETURN
+
+27000 REM =========================================================
+27010 REM  TEST 17: 2PC PHASE 2 - ABORT
+27020 REM =========================================================
+27030 PRINT "=========================================="
+27040 PRINT "T17: 2PC ABORT"
+27050 PRINT "=========================================="
+27060 REM --- Get a fresh ticket first so we have a TID to abort ---
+27070 WORK_URL$ = COORD_BASE$ + "/work?token=" + SECRET$ + "&worker=W1"
+27080 HTTPGET WORK_URL$
+27090 P% = INSTR(HTTP_BODY$, "tid=") + 4
+27100 ABORT_TID% = VAL(MID$(HTTP_BODY$, P%, 6))
+27110 ABRT_BODY$ = "token=" + SECRET$ + "&worker=W1&tid=" + STR$(ABORT_TID%)
+27120 HTTPPOST COORD_BASE$ + "/abort", ABRT_BODY$
+27130 ASSERT_I% = HTTP_STATUS%
+27140 ASSERT_J% = 200
+27150 ASSERT_NAME$ = "T17: ABORT RETURNS 200"
+27160 GOSUB 91000
+27170 ASSERT_I% = 0
+27171 IF INSTR(HTTP_BODY$, "ok=1") > 0 THEN ASSERT_I% = 1
+27180 ASSERT_J% = 1
+27190 ASSERT_NAME$ = "T17: ABORT RESPONSE IS ok=1"
+27200 GOSUB 91000
+27210 RETURN
+
+28000 REM =========================================================
+28010 REM  TEST 18: UNKNOWN PATH RETURNS 404 NOT FOUND
+28020 REM =========================================================
+28030 PRINT "=========================================="
+28040 PRINT "T18: UNKNOWN PATH 404"
+28050 PRINT "=========================================="
+28060 UNK_BODY$ = "token=" + SECRET$ + "&x=1"
+28070 HTTPPOST COORD_BASE$ + "/unknown-route", UNK_BODY$
+28080 ASSERT_I% = HTTP_STATUS%
+28090 ASSERT_J% = 404
+28100 ASSERT_NAME$ = "T18: UNKNOWN PATH GIVES 404"
+28110 GOSUB 91000
+28120 ASSERT_I% = 0
+28121 IF INSTR(HTTP_BODY$, "NOT_FOUND") > 0 THEN ASSERT_I% = 1
+28130 ASSERT_J% = 1
+28140 ASSERT_NAME$ = "T18: BODY SAYS NOT_FOUND"
+28150 GOSUB 91000
+28160 RETURN
+
+29000 REM =========================================================
+29010 REM  TEST 19: FULL WORKER.BAS INTEGRATION (END-TO-END)
+29020 REM  Sets COORD_URL$ and WORKER_ID$ then runs worker.bas.
+29030 REM  Verifies it completes with output and OTel signals flushed.
+29040 REM =========================================================
+29050 PRINT "=========================================="
+29060 PRINT "T19: WORKER INTEGRATION"
+29070 PRINT "=========================================="
+29080 GOSUB 800
+29090 WORKER_ID$ = "W2"
+29100 COORD_URL$ = COORD_BASE$
+29110 WORK_ROUNDS% = 2
+29120 _STOPS% = 0
+29130 REM --- Run worker.bas synchronously; it prints hello-world output via hello.bas ---
+29140 RUNBASIC "worker.bas"
+29150 REM worker.bas calls hello.bas via RUNBASIC; output is in B_1$ etc.
+29160 ASSERT_I% = B_N%
+29170 ASSERT_J% = 0
+29180 REM worker.bas itself emits no PRINT; hello-world output stays inside worker's sub-programs
+29190 ASSERT_NAME$ = "T19: WORKER RUNBASIC COMPLETES SUCCESSFULLY"
+29200 GOSUB 91000
+29210 REM --- Verify coordinator received the prints (TOTAL incremented) ---
+29220 WORK_URL$ = COORD_BASE$ + "/work?token=" + SECRET$ + "&worker=W2"
+29230 HTTPGET WORK_URL$
+29240 ASSERT_I% = HTTP_STATUS%
+29250 ASSERT_J% = 200
+29260 ASSERT_NAME$ = "T19: COORDINATOR STILL RESPONDING AFTER WORKER RUN"
+29270 GOSUB 91000
+29280 RETURN

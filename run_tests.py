@@ -16,7 +16,7 @@ from basic_emulator import BasicProgram, BasicRuntime
 def main() -> int:
     program = BasicProgram.from_file(Path("tests.bas"))
     runtime = BasicRuntime(program)
-    runtime.run()
+    runtime.run(max_steps=5_000_000)
     for line in runtime.output:
         print(line)
     return int(runtime.vars.get("_EXIT_CODE%", 1))
