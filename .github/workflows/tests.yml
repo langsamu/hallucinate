@@ -11,25 +11,28 @@ jobs:
   unit-tests:
     runs-on: ubuntu-latest
 
-    services:
-      # OpenTelemetry Collector: receives OTLP/HTTP signals from hello.bas on
-      # port 4318 and exports them via the debug exporter (stdout) and a file
-      # exporter (/tmp/otel-signals.json) for CI visualisation.
-      otel-collector:
-        image: otel/opentelemetry-collector-contrib:0.100.0
-        ports:
-          - 4318:4318
-        volumes:
-          - ${{ github.workspace }}/otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml
-        options: >-
-          --health-cmd "wget -qO- http://localhost:13133 || exit 1"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 10
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Start OpenTelemetry Collector
+        # GitHub Actions service container volumes cannot bind-mount individual
+        # files (only directories), so we start the collector as a regular step
+        # using `docker run` where per-file mounts work correctly.
+        run: |
+          docker run --rm -d \
+            --name otel-collector \
+            -p 4318:4318 \
+            -v "${{ github.workspace }}/otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml" \
+            otel/opentelemetry-collector-contrib:0.100.0
+          # Wait up to 30 seconds for the collector's health endpoint to respond.
+          for i in $(seq 1 30); do
+            if wget -qO- http://localhost:13133 2>/dev/null; then
+              echo "OTel Collector is ready"
+              break
+            fi
+            sleep 1
+          done
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -55,4 +58,5 @@ jobs:
           echo "=========================================="
           echo "OPENTELEMETRY COLLECTOR SIGNAL OUTPUT:"
           echo "=========================================="
-          docker logs $(docker ps -q --filter "ancestor=otel/opentelemetry-collector-contrib:0.100.0") 2>&1 | grep -E "(LogRecord|Span|Metric|hello|HELLO|iteration|RECOVERED)" | head -100 || true
+          docker logs otel-collector 2>&1 | grep -E "(LogRecord|Span|Metric|hello|HELLO|iteration|RECOVERED)" | head -100 || true
+          docker stop otel-collector 2>/dev/null || true
