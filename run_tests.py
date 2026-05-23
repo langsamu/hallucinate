@@ -1,33 +1,26 @@
-import unittest
+"""Test runner: executes tests.bas through the BASIC emulator.
 
-from basic_test_framework import (
-    hello_bas_line_coverage,
-    hello_bas_transpiled_js_line_coverage,
-    hello_bas_transpiled_javascript,
-    run_hello_program_transpiled_js,
-)
+This file is intentionally minimal.  All test logic, coverage tracking,
+transpilation checks, and JS-equivalence validation live in tests.bas.
+The emulator (basic_emulator.py) provides the BASIC runtime plus the
+extended instructions (RUNBASIC, NODERUN, TRANSPILE, NODECHECK, …) that
+the BASIC test suite depends on.
+"""
+
+import sys
+from pathlib import Path
+
+from basic_emulator import BasicProgram, BasicRuntime
 
 
 def main() -> int:
-    suite = unittest.defaultTestLoader.discover(".")
-    result = unittest.TextTestRunner(verbosity=2).run(suite)
-    print("hello.bas transpiled JavaScript:")
-    print(hello_bas_transpiled_javascript())
-    print("transpiled JS program output (first 5 iterations):")
-    js_output = run_hello_program_transpiled_js(stop_after_prints=5)
-    for line in js_output["output"]:
+    program = BasicProgram.from_file(Path("tests.bas"))
+    runtime = BasicRuntime(program)
+    runtime.run()
+    for line in runtime.output:
         print(line)
-    covered, total, percent, missing = hello_bas_line_coverage()
-    js_covered, js_total, js_percent, js_missing = hello_bas_transpiled_js_line_coverage()
-    print(f"hello.bas line coverage: {covered}/{total} ({percent:.1f}%)")
-    print(f"transpiled JS mapped coverage: {js_covered}/{js_total} ({js_percent:.1f}%)")
-    if missing:
-        print(f"Missing hello.bas lines (BASIC runtime): {', '.join(str(line) for line in missing)}")
-    if js_missing:
-        print(f"Missing hello.bas lines (transpiled JS runtime): {', '.join(str(line) for line in js_missing)}")
-
-    return 0 if result.wasSuccessful() and percent == 100.0 and js_percent == 100.0 else 1
+    return int(runtime.vars.get("_EXIT_CODE%", 1))
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())

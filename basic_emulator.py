@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import json
 import re
+import shutil
+import subprocess
+import tempfile
+import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -212,6 +217,9 @@ class BasicRuntime:
         self.line_order = sorted(program.lines)
         self.fault_once_lines = set(fault_once_lines or set())
         self.executed_lines: set[int] = set()
+        # Coverage stores: accumulated executed lines per filename across RUNBASIC/NODERUN calls.
+        self._bas_coverage: dict[str, set[int]] = {}
+        self._js_coverage: dict[str, set[int]] = {}
 
     def run(
         self,
@@ -255,8 +263,13 @@ class BasicRuntime:
         return self.line_order[index + 1]
 
     def _execute_statement(self, statement: str) -> None:
-        if statement.startswith("REM "):
+        if statement.startswith("REM ") or statement == "REM":
             self.pc = self._next_line(self.pc)
+            return
+
+        if statement == "END":
+            # Halt execution by moving PC to a line that does not exist.
+            self.pc = -1
             return
 
         if statement.startswith("ON ERROR GOTO "):
@@ -323,9 +336,48 @@ class BasicRuntime:
             self.pc = self._next_line(self.pc)
             return
 
+        # ---- New system instructions used by tests.bas -------------------------
+
+        if statement.startswith('RUNBASIC "') and statement.endswith('"'):
+            self._exec_runbasic(statement[len('RUNBASIC "'):-1])
+            return
+
+        if statement.startswith('NODERUN "') and statement.endswith('"'):
+            self._exec_noderun(statement[len('NODERUN "'):-1])
+            return
+
+        if statement.startswith('TRANSPILE "') and statement.endswith('"'):
+            self._exec_transpile(statement[len('TRANSPILE "'):-1])
+            return
+
+        if statement.startswith('NODECHECK "') and statement.endswith('"'):
+            self._exec_nodecheck(statement[len('NODECHECK "'):-1])
+            return
+
+        if statement.startswith('COVCNT "') and statement.endswith('"'):
+            self._exec_covcnt(statement[len('COVCNT "'):-1])
+            return
+
+        if statement.startswith('JCOVCNT "') and statement.endswith('"'):
+            self._exec_jcovcnt(statement[len('JCOVCNT "'):-1])
+            return
+
+        if statement.startswith('CLRCOV "') and statement.endswith('"'):
+            self._bas_coverage.pop(statement[len('CLRCOV "'):-1], None)
+            self.pc = self._next_line(self.pc)
+            return
+
+        if statement.startswith('CLRJCOV "') and statement.endswith('"'):
+            self._js_coverage.pop(statement[len('CLRJCOV "'):-1], None)
+            self.pc = self._next_line(self.pc)
+            return
+
         raise RuntimeError(f"unsupported statement: {statement}")
 
     def _eval_condition(self, text: str) -> bool:
+        if " <> " in text:
+            left, right = text.split(" <> ", 1)
+            return self._eval_expr(left.strip()) != self._eval_expr(right.strip())
         if " > " in text:
             left, right = text.split(" > ", 1)
             return int(self._eval_expr(left.strip())) > int(self._eval_expr(right.strip()))
@@ -346,6 +398,11 @@ class BasicRuntime:
         if len_match:
             inner = len_match.group(1).strip()
             return len(str(self.vars.get(inner, "")))
+        instr_match = re.fullmatch(r"INSTR\(([^,]+),\s*(.+)\)", expr)
+        if instr_match:
+            haystack = str(self._eval_expr(instr_match.group(1).strip()))
+            needle = str(self._eval_expr(instr_match.group(2).strip()))
+            return 1 if needle in haystack else 0
         if expr in self.vars:
             return self.vars[expr]
         if expr.endswith("%"):
@@ -353,3 +410,145 @@ class BasicRuntime:
         if expr.endswith("$"):
             return ""
         raise RuntimeError(f"unsupported expression: {expr}")
+
+    # ---- Helper methods for the new system instructions -----------------------
+
+    def _get_run_params(self) -> tuple[int | None, int | None, set[int], dict[str, int | str]]:
+        """Read the shared run-parameter variables set by the calling BASIC program.
+
+        Convention (all prefixed with underscore to avoid clashing with BASIC
+        program variables):
+          _START%  - first line to execute (0 = use the program's own first line)
+          _STOPS%  - stop after this many PRINT statements (0 = run to completion)
+          _FAULT%  - inject a one-time fault at this line number (0 = none)
+          _SETV%   - 1 = seed initial variables from _IMSG$ and _IITER%; 0 = don't
+          _IMSG$   - initial value for MESSAGE$  (only used when _SETV% = 1)
+          _IITER%  - initial value for ITERATION% (only used when _SETV% = 1)
+        """
+        start = int(self.vars.get("_START%", 0)) or None
+        stops = int(self.vars.get("_STOPS%", 0)) or None
+        fault = int(self.vars.get("_FAULT%", 0))
+        set_vars = int(self.vars.get("_SETV%", 0))
+        initial_vars: dict[str, int | str] = {}
+        if set_vars:
+            initial_vars["MESSAGE$"] = self.vars.get("_IMSG$", "")
+            initial_vars["ITERATION%"] = int(self.vars.get("_IITER%", 0))
+        fault_once = {fault} if fault else set()
+        return start, stops, fault_once, initial_vars
+
+    def _exec_runbasic(self, filename: str) -> None:
+        """Run another BASIC program and store results in B_* variables.
+
+        Reads run parameters from _START%, _STOPS%, _FAULT%, _SETV%, _IMSG$,
+        _IITER% (see _get_run_params).  After execution:
+          B_N%          - number of output lines produced
+          B_1$ .. B_9$  - individual output lines (empty string if fewer than 9)
+          B_MSG$        - final value of MESSAGE$ in the sub-program
+          B_ITER%       - final value of ITERATION% in the sub-program
+        Also accumulates executed line numbers into self._bas_coverage[filename].
+        """
+        start, stops, fault_once, initial_vars = self._get_run_params()
+        prog = BasicProgram.from_file(Path(filename))
+        rt = BasicRuntime(prog, initial_vars=initial_vars, fault_once_lines=fault_once)
+        rt.run(max_steps=100000, stop_after_prints=stops, start_line=start)
+        self.vars["B_N%"] = len(rt.output)
+        for i in range(9):
+            self.vars[f"B_{i + 1}$"] = rt.output[i] if i < len(rt.output) else ""
+        self.vars["B_MSG$"] = rt.vars.get("MESSAGE$", "")
+        self.vars["B_ITER%"] = int(rt.vars.get("ITERATION%", 0))
+        self._bas_coverage.setdefault(filename, set()).update(rt.executed_lines)
+        self.pc = self._next_line(self.pc)
+
+    def _exec_noderun(self, filename: str) -> None:
+        """Transpile a BASIC program to JS and run it, storing results in J_* variables.
+
+        Uses the same _* run parameters as _exec_runbasic.  After execution:
+          J_N%          - number of output lines produced
+          J_1$ .. J_9$  - individual output lines
+          J_MSG$        - final value of MESSAGE$
+          J_ITER%       - final value of ITERATION%
+        Also accumulates executed line numbers into self._js_coverage[filename].
+        """
+        start, stops, fault_once, initial_vars = self._get_run_params()
+        prog = BasicProgram.from_file(Path(filename))
+        js = prog.transpile_to_javascript()
+        harness = textwrap.dedent(
+            """
+            const options = JSON.parse(process.argv[2]);
+            const result = runBasicProgram(options);
+            console.log(JSON.stringify(result));
+            """
+        )
+        options = {
+            "maxSteps": 100000,
+            "stopAfterPrints": stops,
+            "startLine": start,
+            "initialVars": initial_vars,
+            "faultOnceLines": sorted(fault_once),
+        }
+        node = shutil.which("node")
+        if not node:
+            raise RuntimeError("node is required to run transpiled JavaScript")
+        with tempfile.TemporaryDirectory() as tmp:
+            js_path = Path(tmp) / "run.js"
+            js_path.write_text(js + "\n" + harness)
+            try:
+                completed = subprocess.run(
+                    [node, str(js_path), json.dumps(options)],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+            except subprocess.CalledProcessError as exc:
+                raise RuntimeError(exc.stderr.strip() or str(exc)) from exc
+        data = json.loads(completed.stdout)
+        output = data["output"]
+        self.vars["J_N%"] = len(output)
+        for i in range(9):
+            self.vars[f"J_{i + 1}$"] = output[i] if i < len(output) else ""
+        self.vars["J_MSG$"] = data["vars"].get("MESSAGE$", "")
+        self.vars["J_ITER%"] = int(data["vars"].get("ITERATION%", 0))
+        executed = {int(ln) for ln in data["executedLines"]}
+        self._js_coverage.setdefault(filename, set()).update(executed)
+        self.pc = self._next_line(self.pc)
+
+    def _exec_transpile(self, filename: str) -> None:
+        """Transpile a BASIC program to JavaScript and store the source in T_JS$."""
+        prog = BasicProgram.from_file(Path(filename))
+        self.vars["T_JS$"] = prog.transpile_to_javascript()
+        self.pc = self._next_line(self.pc)
+
+    def _exec_nodecheck(self, filename: str) -> None:
+        """Transpile a BASIC program and syntax-check the JS with node --check.
+
+        Sets T_OK% = 1 if the generated JS is syntactically valid, 0 otherwise.
+        """
+        prog = BasicProgram.from_file(Path(filename))
+        js = prog.transpile_to_javascript()
+        node = shutil.which("node")
+        if not node:
+            self.vars["T_OK%"] = 0
+            self.pc = self._next_line(self.pc)
+            return
+        with tempfile.TemporaryDirectory() as tmp:
+            js_path = Path(tmp) / "check.js"
+            js_path.write_text(js)
+            result = subprocess.run([node, "--check", str(js_path)], capture_output=True)
+        self.vars["T_OK%"] = 1 if result.returncode == 0 else 0
+        self.pc = self._next_line(self.pc)
+
+    def _exec_covcnt(self, filename: str) -> None:
+        """Read accumulated BASIC coverage for a file into B_COVC% and B_TOTL%."""
+        prog = BasicProgram.from_file(Path(filename))
+        covered = self._bas_coverage.get(filename, set())
+        self.vars["B_COVC%"] = len(covered)
+        self.vars["B_TOTL%"] = len(prog.lines)
+        self.pc = self._next_line(self.pc)
+
+    def _exec_jcovcnt(self, filename: str) -> None:
+        """Read accumulated JS coverage for a file into J_COVC% and J_TOTL%."""
+        prog = BasicProgram.from_file(Path(filename))
+        covered = self._js_coverage.get(filename, set())
+        self.vars["J_COVC%"] = len(covered)
+        self.vars["J_TOTL%"] = len(prog.lines)
+        self.pc = self._next_line(self.pc)
