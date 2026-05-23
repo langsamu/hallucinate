@@ -24,16 +24,21 @@ jobs:
         # docker cp step required.
         run: |
           mkdir -p otel-signals
-          docker run --rm -d \
+          # The otelcol user inside the container (UID 10001) must be able to write
+          # to the /signals mount, which is owned by the runner user on the host.
+          # Make the directory world-writable so the container user can create files.
+          chmod 777 otel-signals
+          docker run -d \
             --name otel-collector \
+            -p 4317:4317 \
             -p 4318:4318 \
             -v "${{ github.workspace }}/otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml" \
             -v "${{ github.workspace }}/otel-signals:/signals" \
             otel/opentelemetry-collector-contrib:0.100.0
-          # Wait up to 30 seconds for the collector's health endpoint to respond.
+          # Wait up to 30 seconds for the OTLP HTTP port (4318) to be ready.
           for i in $(seq 1 30); do
-            if wget -qO- http://localhost:13133 2>/dev/null; then
-              echo "OTel Collector is ready"
+            if wget -qO- http://localhost:4318 2>&1 | grep -q "404 page not found"; then
+              echo "OTel Collector is ready on port 4318"
               break
             fi
             sleep 1
@@ -64,11 +69,16 @@ jobs:
           echo "OPENTELEMETRY COLLECTOR SIGNAL OUTPUT:"
           echo "=========================================="
           docker logs otel-collector 2>&1 | grep -E "(LogRecord|Span|Metric|hello|HELLO|iteration|RECOVERED)" | head -100 || true
+          echo "=========================================="
+          echo "OPENTELEMETRY COLLECTOR FULL LOGS (last 50 lines):"
+          echo "=========================================="
+          docker logs otel-collector 2>&1 | tail -50 || true
 
       - name: Stop OTel Collector and list signal files
         if: always()
         run: |
           docker stop otel-collector 2>/dev/null || true
+          docker rm   otel-collector 2>/dev/null || true
           # Signal files are written directly to otel-signals/ on the host
           # (mounted into the container as /signals/) — no docker cp needed.
           ls -lh otel-signals/ || true
