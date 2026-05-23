@@ -63,6 +63,10 @@ jobs:
       - name: Collect OTel signal files from container
         if: always()
         run: |
+          # Give the file exporter a moment to finish writing any in-flight
+          # records before we copy them out. Even without a batch processor
+          # the exporter may buffer a final write.
+          sleep 2
           # Copy the OTLP JSON signal files out of the collector container
           # so they can be uploaded as CI artifacts for Jaeger import.
           # Each file is in OTLP JSON (line-delimited) format:

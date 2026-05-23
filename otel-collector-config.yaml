@@ -17,6 +17,12 @@
 # Each signal type gets its own file so the CI "Upload OTel signals" step can
 # attach them as separate named artifacts, making it easy to download just
 # the traces and drop them into Jaeger for analysis.
+#
+# NOTE: No batch processor is used. Signals are exported immediately as they
+# arrive so that the file exporter writes its output before CI copies the
+# files with "docker cp". A batch processor would delay writes until its
+# timeout fires, causing "file not found" errors when CI copies immediately
+# after the test run ends.
 
 receivers:
   otlp:
@@ -43,20 +49,14 @@ exporters:
     rotation:
       max_megabytes: 10
 
-processors:
-  batch:
-
 service:
   pipelines:
     traces:
       receivers: [otlp]
-      processors: [batch]
       exporters: [debug, file/traces]
     metrics:
       receivers: [otlp]
-      processors: [batch]
       exporters: [debug, file/metrics]
     logs:
       receivers: [otlp]
-      processors: [batch]
       exporters: [debug, file/logs]
