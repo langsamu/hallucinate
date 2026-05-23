@@ -91,10 +91,8 @@ def run_hello_program_transpiled_js(
     transpiled = hello_bas_transpiled_javascript()
     harness = textwrap.dedent(
         """
-        const source = process.env.TRANSPILED_SOURCE || "";
-        const options = JSON.parse(process.argv[1]);
-        eval(source + "\\n;globalThis.__runBasicProgram = runBasicProgram;");
-        const result = globalThis.__runBasicProgram(options);
+        const options = JSON.parse(process.argv[2]);
+        const result = runBasicProgram(options);
         console.log(JSON.stringify(result));
         """
     )
@@ -105,16 +103,18 @@ def run_hello_program_transpiled_js(
         "initialVars": initial_vars or {},
         "faultOnceLines": sorted(fault_once_lines or set()),
     }
-    try:
-        completed = subprocess.run(
-            [_node_executable(), "-e", harness, json.dumps(options)],
-            check=True,
-            capture_output=True,
-            text=True,
-            env={**os.environ, "TRANSPILED_SOURCE": transpiled},
-        )
-    except subprocess.CalledProcessError as exc:
-        raise RuntimeError(exc.stderr.strip() or exc.stdout.strip() or str(exc)) from exc
+    with tempfile.TemporaryDirectory() as temp_dir:
+        js_path = Path(temp_dir) / "transpiled.js"
+        js_path.write_text(transpiled + "\n" + harness)
+        try:
+            completed = subprocess.run(
+                [_node_executable(), str(js_path), json.dumps(options)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(exc.stderr.strip() or exc.stdout.strip() or str(exc)) from exc
     return json.loads(completed.stdout)
 
 
