@@ -3,12 +3,20 @@
 # Receives OTLP signals (traces, metrics, logs) from the BASIC emulator over
 # HTTP on port 4318, then exports them two ways:
 #
-#   debug  - prints every signal in human-readable detail to the collector's
-#            own stdout so CI can capture it with "docker logs".
+#   debug        - prints every signal in human-readable detail to the
+#                  collector's own stdout so CI can capture it with
+#                  "docker logs".
 #
-#   file   - writes JSON-encoded signal records to /tmp/otel-signals.json
-#            line-by-line so the CI "Visualize OpenTelemetry signals" step
-#            can print and format them directly.
+#   file/traces  - writes OTLP JSON trace records to /tmp/otel-traces.json
+#                  (importable into Jaeger via File > Import Trace).
+#
+#   file/metrics - writes OTLP JSON metric records to /tmp/otel-metrics.json.
+#
+#   file/logs    - writes OTLP JSON log records to /tmp/otel-logs.json.
+#
+# Each signal type gets its own file so the CI "Upload OTel signals" step can
+# attach them as separate named artifacts, making it easy to download just
+# the traces and drop them into Jaeger for analysis.
 
 receivers:
   otlp:
@@ -20,8 +28,18 @@ exporters:
   debug:
     verbosity: detailed
 
-  file:
-    path: /tmp/otel-signals.json
+  file/traces:
+    path: /tmp/otel-traces.json
+    rotation:
+      max_megabytes: 10
+
+  file/metrics:
+    path: /tmp/otel-metrics.json
+    rotation:
+      max_megabytes: 10
+
+  file/logs:
+    path: /tmp/otel-logs.json
     rotation:
       max_megabytes: 10
 
@@ -33,12 +51,12 @@ service:
     traces:
       receivers: [otlp]
       processors: [batch]
-      exporters: [debug, file]
+      exporters: [debug, file/traces]
     metrics:
       receivers: [otlp]
       processors: [batch]
-      exporters: [debug, file]
+      exporters: [debug, file/metrics]
     logs:
       receivers: [otlp]
       processors: [batch]
-      exporters: [debug, file]
+      exporters: [debug, file/logs]
