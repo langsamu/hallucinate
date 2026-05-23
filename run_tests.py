@@ -4,6 +4,7 @@ from basic_test_framework import (
     hello_bas_line_coverage,
     hello_bas_transpiled_js_line_coverage,
     hello_bas_transpiled_javascript,
+    run_hello_program_transpiled_js,
 )
 
 
@@ -12,6 +13,10 @@ def main() -> int:
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     print("hello.bas transpiled JavaScript:")
     print(hello_bas_transpiled_javascript())
+    print("transpiled JS program output (first 5 iterations):")
+    js_output = run_hello_program_transpiled_js(stop_after_prints=5)
+    for line in js_output["output"]:
+        print(line)
     covered, total, percent, missing = hello_bas_line_coverage()
     js_covered, js_total, js_percent, js_missing = hello_bas_transpiled_js_line_coverage()
     print(f"hello.bas line coverage: {covered}/{total} ({percent:.1f}%)")
