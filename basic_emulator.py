@@ -103,7 +103,11 @@ class BasicProgram:
                 ]
             if statement.startswith("RESUME "):
                 target = int(statement.removeprefix("RESUME ").strip())
-                return [f"{indent}pc = {target};"]
+                return [
+                    f"{indent}if (resumeLine === null) throw new Error('RESUME without active error');",
+                    f"{indent}pc = {target};",
+                    f"{indent}resumeLine = null;",
+                ]
             if statement.startswith("PRINT "):
                 parts = [part.strip() for part in statement.removeprefix("PRINT ").split(";")]
                 rendered = " + ".join(f"String({js_expr(part)})" for part in parts) or '""'
