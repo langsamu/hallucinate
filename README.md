@@ -13,6 +13,7 @@ It is not duplicated here to keep the source of truth in one file.
 
 Execution-based unit tests are provided via a small BASIC emulator.
 
+- Prerequisites for local runs: Python and Node.js installed and available on `PATH`.
 - Run locally: `python run_tests.py`
 - The test runner emits `hello.bas` transpiled to JavaScript.
 - The suite validates transpiled JavaScript syntax/execution and BASIC↔JS semantic equivalence.
