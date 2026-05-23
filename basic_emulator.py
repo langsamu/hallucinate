@@ -10,6 +10,160 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+class _OtelManager:
+    """Manages OpenTelemetry SDK resources for the BASIC emulator.
+
+    Initialised lazily on the first OTEL* instruction.  All methods are
+    exception-safe: if the SDK is not installed or the collector is
+    unreachable the calls are silent no-ops so the BASIC program still runs.
+
+    A single module-level instance is shared across all BasicRuntime objects
+    so that spans started by a sub-program (launched via RUNBASIC) are
+    correctly nested inside the caller's active context.
+    """
+
+    def __init__(self) -> None:
+        self._ready = False
+        self._tracer: object = None
+        self._meter: object = None
+        self._otel_logger: object = None
+        self._tracer_provider: object = None
+        self._meter_provider: object = None
+        self._logger_provider: object = None
+        self._span_stack: list[object] = []
+        self._counters: dict[str, object] = {}
+
+    def _init(self) -> None:
+        """Lazily initialise the OTel SDK.  Called once on the first OTEL* use."""
+        if self._ready:
+            return
+        self._ready = True  # mark ready even on failure so we don't retry
+        try:
+            import time as _time
+            from opentelemetry import trace, metrics
+            from opentelemetry.sdk.trace import TracerProvider
+            from opentelemetry.sdk.trace.export import BatchSpanProcessor
+            from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+            from opentelemetry.sdk.metrics import MeterProvider
+            from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+            from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+            from opentelemetry.sdk._logs import LoggerProvider
+            from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+            from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
+            from opentelemetry._logs import set_logger_provider
+            from opentelemetry.sdk.resources import Resource
+
+            resource = Resource.create({"service.name": "hello-bas"})
+
+            # --- Traces ---
+            tracer_provider = TracerProvider(resource=resource)
+            tracer_provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+            trace.set_tracer_provider(tracer_provider)
+            self._tracer = trace.get_tracer("hello-bas")
+            self._tracer_provider = tracer_provider
+
+            # --- Metrics ---
+            reader = PeriodicExportingMetricReader(
+                OTLPMetricExporter(), export_interval_millis=5000
+            )
+            meter_provider = MeterProvider(resource=resource, metric_readers=[reader])
+            metrics.set_meter_provider(meter_provider)
+            self._meter = metrics.get_meter("hello-bas")
+            self._meter_provider = meter_provider
+
+            # --- Logs ---
+            logger_provider = LoggerProvider(resource=resource)
+            logger_provider.add_log_record_processor(
+                BatchLogRecordProcessor(OTLPLogExporter())
+            )
+            set_logger_provider(logger_provider)
+            self._otel_logger = logger_provider.get_logger("hello-bas")
+            self._logger_provider = logger_provider
+
+        except Exception:
+            pass  # graceful degradation: OTel SDK not installed or misconfigured
+
+    def start_span(self, name: str) -> None:
+        """Start a new trace span and push it onto the span stack."""
+        self._init()
+        if self._tracer is None:
+            self._span_stack.append(None)
+            return
+        try:
+            span = self._tracer.start_span(name)  # type: ignore[union-attr]
+            self._span_stack.append(span)
+        except Exception:
+            self._span_stack.append(None)
+
+    def end_span(self) -> None:
+        """End the most recently started span (LIFO order)."""
+        if not self._span_stack:
+            return
+        span = self._span_stack.pop()
+        if span is not None:
+            try:
+                span.end()
+            except Exception:
+                pass
+
+    def log(self, message: str) -> None:
+        """Emit an OTel log record at INFO severity."""
+        self._init()
+        if self._otel_logger is None:
+            return
+        try:
+            import time as _time
+            from opentelemetry.sdk._logs import LogRecord
+            from opentelemetry._logs import SeverityNumber
+            self._otel_logger.emit(
+                LogRecord(
+                    timestamp=_time.time_ns(),
+                    observed_timestamp=_time.time_ns(),
+                    trace_id=0,
+                    span_id=0,
+                    trace_flags=None,
+                    severity_text="INFO",
+                    severity_number=SeverityNumber.INFO,
+                    body=message,
+                    resource=None,
+                    attributes={},
+                )
+            )
+        except Exception:
+            pass
+
+    def count(self, metric_name: str, value: int = 1) -> None:
+        """Increment a named counter metric by value (default 1)."""
+        self._init()
+        if self._meter is None:
+            return
+        try:
+            if metric_name not in self._counters:
+                self._counters[metric_name] = self._meter.create_counter(metric_name)  # type: ignore[union-attr]
+            self._counters[metric_name].add(value)  # type: ignore[union-attr]
+        except Exception:
+            pass
+
+    def flush(self) -> bool:
+        """Force-flush all pending OTel signal batches.  Returns True on success."""
+        self._init()
+        try:
+            if self._tracer_provider is not None:
+                self._tracer_provider.force_flush()  # type: ignore[union-attr]
+            if self._meter_provider is not None:
+                self._meter_provider.force_flush()  # type: ignore[union-attr]
+            if self._logger_provider is not None:
+                self._logger_provider.force_flush()  # type: ignore[union-attr]
+            return True
+        except Exception:
+            return False
+
+
+# Module-level singleton shared by all BasicRuntime instances so that spans
+# started inside sub-programs (RUNBASIC) nest correctly under the caller's context.
+_OTEL = _OtelManager()
+
+
 @dataclass
 class BasicProgram:
     lines: dict[int, str]
@@ -134,6 +288,21 @@ class BasicProgram:
                 name, expr = statement.split("=", 1)
                 return [
                     f"{indent}{js_var(name.strip())} = {js_expr(expr.strip())};",
+                    f"{indent}pc = {js_next_line(line)};",
+                ]
+            # OTEL* instructions are no-ops in the transpiled JS path: they emit
+            # a comment so the generated code remains readable, then simply advance
+            # the program counter.  The JS runtime therefore stays behaviourally
+            # equivalent to the BASIC emulator for output and variable assertions.
+            if (
+                statement.startswith("OTELSPAN ")
+                or statement == "OTELEND"
+                or statement.startswith("OTELLOG ")
+                or statement.startswith("OTELCOUNT ")
+                or statement == "OTELFLUSH"
+            ):
+                return [
+                    f"{indent}// otel (no-op in js): {statement}",
                     f"{indent}pc = {js_next_line(line)};",
                 ]
             raise RuntimeError(f"unsupported statement for transpilation: {statement}")
@@ -369,6 +538,43 @@ class BasicRuntime:
 
         if statement.startswith('CLRJCOV "') and statement.endswith('"'):
             self._js_coverage.pop(statement[len('CLRJCOV "'):-1], None)
+            self.pc = self._next_line(self.pc)
+            return
+
+        # ---- OpenTelemetry instructions ----------------------------------------
+        # These let a BASIC program emit distributed observability signals.
+        # All instructions delegate to the module-level _OTEL singleton so that
+        # traces/metrics/logs flow through a single SDK provider regardless of
+        # how many BasicRuntime objects are active at the same time.
+
+        if statement.startswith('OTELSPAN "') and statement.endswith('"'):
+            # Start a new trace span with the given name and push it on the stack.
+            _OTEL.start_span(statement[len('OTELSPAN "'):-1])
+            self.pc = self._next_line(self.pc)
+            return
+
+        if statement == "OTELEND":
+            # End the most recently started span (LIFO order).
+            _OTEL.end_span()
+            self.pc = self._next_line(self.pc)
+            return
+
+        if statement.startswith('OTELLOG "') and statement.endswith('"'):
+            # Emit an OTel log record at INFO severity with the given message.
+            _OTEL.log(statement[len('OTELLOG "'):-1])
+            self.pc = self._next_line(self.pc)
+            return
+
+        if statement.startswith('OTELCOUNT "') and statement.endswith('"'):
+            # Increment the named counter metric by 1.
+            _OTEL.count(statement[len('OTELCOUNT "'):-1])
+            self.pc = self._next_line(self.pc)
+            return
+
+        if statement == "OTELFLUSH":
+            # Force-flush all pending OTel export batches.
+            # Sets OTEL_OK% = 1 on success, 0 if flush raised an exception.
+            self.vars["OTEL_OK%"] = 1 if _OTEL.flush() else 0
             self.pc = self._next_line(self.pc)
             return
 

@@ -1,0 +1,44 @@
+# OpenTelemetry Collector configuration for hello.bas observability
+#
+# Receives OTLP signals (traces, metrics, logs) from the BASIC emulator over
+# HTTP on port 4318, then exports them two ways:
+#
+#   debug  - prints every signal in human-readable detail to the collector's
+#            own stdout so CI can capture it with "docker logs".
+#
+#   file   - writes JSON-encoded signal records to /tmp/otel-signals.json
+#            line-by-line so the CI "Visualize OpenTelemetry signals" step
+#            can print and format them directly.
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: "0.0.0.0:4318"
+
+exporters:
+  debug:
+    verbosity: detailed
+
+  file:
+    path: /tmp/otel-signals.json
+    rotation:
+      max_megabytes: 10
+
+processors:
+  batch:
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug, file]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug, file]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug, file]

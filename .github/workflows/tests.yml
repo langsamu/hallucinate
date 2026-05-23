@@ -10,6 +10,23 @@ permissions:
 jobs:
   unit-tests:
     runs-on: ubuntu-latest
+
+    services:
+      # OpenTelemetry Collector: receives OTLP/HTTP signals from hello.bas on
+      # port 4318 and exports them via the debug exporter (stdout) and a file
+      # exporter (/tmp/otel-signals.json) for CI visualisation.
+      otel-collector:
+        image: otel/opentelemetry-collector-contrib:0.100.0
+        ports:
+          - 4318:4318
+        volumes:
+          - ${{ github.workspace }}/otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml
+        options: >-
+          --health-cmd "wget -qO- http://localhost:13133 || exit 1"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -24,5 +41,18 @@ jobs:
         with:
           node-version: "20"
 
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
       - name: Run tests
+        env:
+          OTEL_EXPORTER_OTLP_ENDPOINT: "http://localhost:4318"
         run: python run_tests.py
+
+      - name: Visualize OpenTelemetry signals
+        if: always()
+        run: |
+          echo "=========================================="
+          echo "OPENTELEMETRY COLLECTOR SIGNAL OUTPUT:"
+          echo "=========================================="
+          docker logs $(docker ps -q --filter "ancestor=otel/opentelemetry-collector-contrib:0.100.0") 2>&1 | grep -E "(LogRecord|Span|Metric|hello|HELLO|iteration|RECOVERED)" | head -100 || true

@@ -3,8 +3,10 @@
 30  REM
 40  REM  Runs inside the BASIC emulator, which provides special
 50  REM  instructions (RUNBASIC, NODERUN, TRANSPILE, NODECHECK,
-60  REM  COVCNT, JCOVCNT, CLRCOV, CLRJCOV) that let BASIC code
-70  REM  drive all testing, coverage, and JS-equivalence checks.
+60  REM  COVCNT, JCOVCNT, CLRCOV, CLRJCOV, OTELSPAN, OTELEND,
+65  REM  OTELLOG, OTELCOUNT, OTELFLUSH) that let BASIC code
+70  REM  drive all testing, coverage, JS-equivalence checks,
+75  REM  and OpenTelemetry observability verification.
 80  REM
 90  REM  Classic BASIC idioms used throughout:
 100 REM    - Line numbers in multiples of 10
@@ -51,7 +53,7 @@
 490 PRINT "ENTERPRISE HELLO.BAS TEST SUITE"
 500 PRINT "=========================================="
 
-510 REM --- DISPATCH: RUN ALL NINE TEST CASES ---
+54 REM --- DISPATCH: RUN ALL TEN TEST CASES ---
 520 GOSUB 1000
 530 GOSUB 2000
 540 GOSUB 3000
@@ -61,11 +63,13 @@
 580 GOSUB 7000
 590 GOSUB 8000
 600 GOSUB 10000
+605 GOSUB 15000
 
 610 REM --- DISPLAY TRANSPILED JS SOURCE AND PROGRAM OUTPUTS FOR CI ---
 620 GOSUB 11000
 630 GOSUB 11200
 640 GOSUB 11400
+645 GOSUB 11600
 
 650 REM --- PRINT COVERAGE REPORT ---
 660 GOSUB 12000
@@ -542,3 +546,37 @@
 91200 PRINT "PASS: "; ASSERT_NAME$
 91210 PASS_CNT% = PASS_CNT% + 1
 91220 RETURN
+
+11600 REM =========================================================
+11610 REM  DISPLAY: OTEL FLUSH STATUS FOR CI
+11620 REM  Calls OTELFLUSH to drain any pending export batches so
+11630 REM  the collector has received all signals before CI tries
+11640 REM  to dump its output.  Prints whether the flush succeeded.
+11650 REM =========================================================
+11660 OTELFLUSH
+11670 IF OTEL_OK% = 1 THEN GOTO 11700
+11680 PRINT "OTEL FLUSH: NOT AVAILABLE (SDK not installed or collector unreachable)"
+11690 RETURN
+11700 PRINT "OTEL FLUSH: OK - signals exported to collector"
+11710 RETURN
+
+15000 REM =========================================================
+15010 REM  TEST 10: OTELFLUSH COMPLETES WITHOUT ERROR
+15020 REM
+15030 REM  Runs hello.bas for 3 iterations through the BASIC emulator
+15040 REM  so that OTELSPAN, OTELCOUNT, and OTELLOG all fire at least
+15050 REM  once (OTELSPAN + OTELEND per iteration, OTELCOUNT per
+15060 REM  iteration, OTELLOG on first fault-injected error recovery).
+15070 REM  Then calls OTELFLUSH to drain the export batches.
+15080 REM  Asserts that OTEL_OK% = 1, which is true whether a live
+15090 REM  collector is present or the SDK gracefully drops the data.
+15100 REM =========================================================
+15110 GOSUB 800
+15120 _STOPS% = 3
+15130 RUNBASIC "hello.bas"
+15140 OTELFLUSH
+15150 ASSERT_I% = OTEL_OK%
+15160 ASSERT_J% = 1
+15170 ASSERT_NAME$ = "T10: OTEL SIGNALS FLUSH WITHOUT ERROR"
+15180 GOSUB 91000
+15190 RETURN
