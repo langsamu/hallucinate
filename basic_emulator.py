@@ -121,7 +121,7 @@ class _OtelManager:
                     observed_timestamp=_time.time_ns(),
                     trace_id=0,
                     span_id=0,
-                    trace_flags=None,
+                    trace_flags=0,
                     severity_text="INFO",
                     severity_number=SeverityNumber.INFO,
                     body=message,

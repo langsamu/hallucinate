@@ -18,12 +18,17 @@ jobs:
       - name: Start OpenTelemetry Collector
         # GitHub Actions service container volumes cannot bind-mount individual
         # files (only directories), so we start the collector as a regular step
-        # using `docker run` where per-file mounts work correctly.
+        # using `docker run` where per-file and per-directory mounts work correctly.
+        # We mount the otel-signals/ directory from the host into /signals/ inside
+        # the container, so the file exporter writes directly to the host — no
+        # docker cp step required.
         run: |
+          mkdir -p otel-signals
           docker run --rm -d \
             --name otel-collector \
             -p 4318:4318 \
             -v "${{ github.workspace }}/otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml" \
+            -v "${{ github.workspace }}/otel-signals:/signals" \
             otel/opentelemetry-collector-contrib:0.100.0
           # Wait up to 30 seconds for the collector's health endpoint to respond.
           for i in $(seq 1 30); do
@@ -60,24 +65,12 @@ jobs:
           echo "=========================================="
           docker logs otel-collector 2>&1 | grep -E "(LogRecord|Span|Metric|hello|HELLO|iteration|RECOVERED)" | head -100 || true
 
-      - name: Collect OTel signal files from container
+      - name: Stop OTel Collector and list signal files
         if: always()
         run: |
-          # Give the file exporter a moment to finish writing any in-flight
-          # records before we copy them out. Even without a batch processor
-          # the exporter may buffer a final write.
-          sleep 2
-          # Copy the OTLP JSON signal files out of the collector container
-          # so they can be uploaded as CI artifacts for Jaeger import.
-          # Each file is in OTLP JSON (line-delimited) format:
-          #   otel-traces.json  — import into Jaeger via Search > JSON File
-          #   otel-metrics.json — OpenTelemetry metrics data
-          #   otel-logs.json    — OpenTelemetry log records
-          mkdir -p otel-signals
-          docker cp otel-collector:/tmp/otel-traces.json  otel-signals/otel-traces.json  2>/dev/null || echo "otel-traces.json not found (no traces emitted)"
-          docker cp otel-collector:/tmp/otel-metrics.json otel-signals/otel-metrics.json 2>/dev/null || echo "otel-metrics.json not found (no metrics emitted)"
-          docker cp otel-collector:/tmp/otel-logs.json    otel-signals/otel-logs.json    2>/dev/null || echo "otel-logs.json not found (no logs emitted)"
           docker stop otel-collector 2>/dev/null || true
+          # Signal files are written directly to otel-signals/ on the host
+          # (mounted into the container as /signals/) — no docker cp needed.
           ls -lh otel-signals/ || true
 
       - name: Upload OTel signals as artifacts
