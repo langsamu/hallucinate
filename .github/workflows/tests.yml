@@ -5,7 +5,8 @@ on:
   pull_request:
 
 permissions:
-  contents: read
+  contents: write       # needed to commit the Jaeger screenshot to the branch
+  pull-requests: write  # needed to post the screenshot as a PR comment
 
 jobs:
   unit-tests:
@@ -14,6 +15,26 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Start Jaeger
+        # Jaeger all-in-one accepts OTLP gRPC on its internal port 4317.
+        # We map that to HOST port 4316 to avoid collision with the OTel
+        # Collector, which already owns host port 4317.  The Jaeger UI is
+        # available at http://localhost:16686.
+        run: |
+          docker run -d \
+            --name jaeger \
+            -p 16686:16686 \
+            -p 4316:4317 \
+            jaegertracing/all-in-one:1.57
+          echo "Waiting for Jaeger UI on port 16686..."
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:16686/ > /dev/null 2>&1; then
+              echo "Jaeger is ready"
+              break
+            fi
+            sleep 1
+          done
 
       - name: Start OpenTelemetry Collector
         # GitHub Actions service container volumes cannot bind-mount individual
@@ -74,11 +95,81 @@ jobs:
           echo "=========================================="
           docker logs otel-collector 2>&1 | tail -50 || true
 
-      - name: Stop OTel Collector and list signal files
+      - name: Screenshot Jaeger trace
+        # Take a headless-browser screenshot of the Jaeger UI showing the
+        # hello-world trace with nested spans.  The screenshot is saved to
+        # screenshots/jaeger-trace.png in the runner workspace.
+        # Failures here are non-fatal — tests already passed above.
+        if: always()
+        continue-on-error: true
+        run: |
+          pip install playwright requests
+          playwright install chromium --with-deps
+          python screenshot_jaeger.py
+
+      - name: Publish Jaeger screenshot as PR comment
+        # Upload the screenshot to the PR branch (via GitHub Contents API so
+        # the file gets a guaranteed-fresh commit SHA URL) then post an
+        # embedded-image comment on the pull request.
+        # Only runs on pull_request events where a PR number is available.
+        if: github.event_name == 'pull_request' && always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ ! -f screenshots/jaeger-trace.png ]; then
+            echo "No screenshot found — skipping PR comment"
+            exit 0
+          fi
+
+          CONTENT=$(base64 -w 0 screenshots/jaeger-trace.png)
+          REPO="${{ github.repository }}"
+          BRANCH="${{ github.head_ref }}"
+          API_PATH="repos/${REPO}/contents/screenshots/jaeger-trace.png"
+
+          # Create or update the file on the PR branch.
+          EXISTING_SHA=$(gh api "${API_PATH}?ref=${BRANCH}" --jq '.sha' 2>/dev/null || echo "")
+
+          if [ -n "$EXISTING_SHA" ]; then
+            RESPONSE=$(gh api "${API_PATH}" \
+              -X PUT \
+              -F "message=ci: update Jaeger trace screenshot [skip ci]" \
+              -F "content=${CONTENT}" \
+              -F "sha=${EXISTING_SHA}" \
+              -F "branch=${BRANCH}")
+          else
+            RESPONSE=$(gh api "${API_PATH}" \
+              -X PUT \
+              -F "message=ci: add Jaeger trace screenshot [skip ci]" \
+              -F "content=${CONTENT}" \
+              -F "branch=${BRANCH}")
+          fi
+
+          # Build a URL keyed on the new commit SHA so GitHub CDN always
+          # serves the freshly committed file (no stale-cache problem).
+          COMMIT_SHA=$(echo "$RESPONSE" | jq -r '.commit.sha')
+          if [ -z "$COMMIT_SHA" ] || [ "$COMMIT_SHA" = "null" ]; then
+            # Fall back to the branch ref if we couldn't parse the SHA.
+            IMAGE_URL="https://raw.githubusercontent.com/${REPO}/${BRANCH}/screenshots/jaeger-trace.png"
+          else
+            IMAGE_URL="https://raw.githubusercontent.com/${REPO}/${COMMIT_SHA}/screenshots/jaeger-trace.png"
+          fi
+
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --repo "${REPO}" \
+            --body "## Jaeger Trace Visualization
+
+![hello-world nested spans in Jaeger](${IMAGE_URL})
+
+*Trace showing \`hello-world-iteration\` as the root span with \`hello-world-initialize\`, \`hello-world-guard\`, \`hello-world-print\`, and \`hello-world-advance\` as nested child spans.*"
+
+      - name: Stop OTel Collector and Jaeger, list signal files
         if: always()
         run: |
           docker stop otel-collector 2>/dev/null || true
           docker rm   otel-collector 2>/dev/null || true
+          docker stop jaeger 2>/dev/null || true
+          docker rm   jaeger 2>/dev/null || true
           # Signal files are written directly to otel-signals/ on the host
           # (mounted into the container as /signals/) — no docker cp needed.
           ls -lh otel-signals/ || true
@@ -91,3 +182,13 @@ jobs:
           path: otel-signals/
           if-no-files-found: warn
           retention-days: 30
+
+      - name: Upload Jaeger screenshot as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jaeger-trace-screenshot
+          path: screenshots/jaeger-trace.png
+          if-no-files-found: warn
+          retention-days: 30
+
