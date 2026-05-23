@@ -155,13 +155,16 @@ jobs:
             IMAGE_URL="https://raw.githubusercontent.com/${REPO}/${COMMIT_SHA}/screenshots/jaeger-trace.png"
           fi
 
+          # Build the body as a variable to avoid YAML indentation issues
+          # (bare ! and * at column-0 inside a literal-block scalar break YAML parsing).
+          PR_BODY=$(printf '%s\n\n%s\n\n%s' \
+            '## Jaeger Trace Visualization' \
+            "![hello-world nested spans in Jaeger](${IMAGE_URL})" \
+            '*Trace showing `hello-world-iteration` as the root span with `hello-world-initialize`, `hello-world-guard`, `hello-world-print`, and `hello-world-advance` as nested child spans.*')
+
           gh pr comment "${{ github.event.pull_request.number }}" \
             --repo "${REPO}" \
-            --body "## Jaeger Trace Visualization
-
-![hello-world nested spans in Jaeger](${IMAGE_URL})
-
-*Trace showing \`hello-world-iteration\` as the root span with \`hello-world-initialize\`, \`hello-world-guard\`, \`hello-world-print\`, and \`hello-world-advance\` as nested child spans.*"
+            --body "${PR_BODY}"
 
       - name: Stop OTel Collector and Jaeger, list signal files
         if: always()
