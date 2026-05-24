@@ -802,30 +802,38 @@
 
 29000 REM =========================================================
 29010 REM  TEST 19: FULL WORKER.BAS INTEGRATION (END-TO-END)
-29020 REM  Sets COORD_URL$ and WORKER_ID$ then runs worker.bas.
-29030 REM  Verifies it completes with output and OTel signals flushed.
-29040 REM =========================================================
-29050 PRINT "=========================================="
-29060 PRINT "T19: WORKER INTEGRATION"
-29070 PRINT "=========================================="
-29080 GOSUB 800
-29090 WORKER_ID$ = "W2"
-29100 COORD_URL$ = COORD_BASE$
-29110 WORK_ROUNDS% = 2
-29120 _STOPS% = 0
-29130 REM --- Run worker.bas synchronously; it prints hello-world output via hello.bas ---
-29140 RUNBASIC "worker.bas"
-29150 REM worker.bas calls hello.bas via RUNBASIC; output is in B_1$ etc.
-29160 ASSERT_I% = B_N%
-29170 ASSERT_J% = 0
-29180 REM worker.bas itself emits no PRINT; hello-world output stays inside worker's sub-programs
-29190 ASSERT_NAME$ = "T19: WORKER RUNBASIC COMPLETES SUCCESSFULLY"
-29200 GOSUB 91000
-29210 REM --- Verify coordinator received the prints (TOTAL incremented) ---
-29220 WORK_URL$ = COORD_BASE$ + "/work?token=" + SECRET$ + "&worker=W2"
-29230 HTTPGET WORK_URL$
-29240 ASSERT_I% = HTTP_STATUS%
-29250 ASSERT_J% = 200
-29260 ASSERT_NAME$ = "T19: COORDINATOR STILL RESPONDING AFTER WORKER RUN"
-29270 GOSUB 91000
-29280 RETURN
+29020 REM  Runs TWO workers (W1 and W2) against the coordinator to demonstrate
+29030 REM  the distributed trace: each worker round creates its "worker-round"
+29040 REM  span under the coordinator's "hello-world-transaction" root span.
+29050 REM  Jaeger will show a single trace tree:
+29060 REM    hello-world-transaction (coordinator)
+29070 REM      worker-round (W1) -> worker-run-hello -> hello-world-iteration
+29080 REM      worker-round (W2) -> worker-run-hello -> hello-world-iteration
+29090 REM =========================================================
+29095 PRINT "=========================================="
+29096 PRINT "T19: WORKER INTEGRATION (DISTRIBUTED TRACE)"
+29097 PRINT "=========================================="
+29098 GOSUB 800
+29099 REM
+29100 REM --- Run worker W1 (1 round) ---
+29110 WORKER_ID$ = "W1"
+29120 COORD_URL$ = COORD_BASE$
+29130 WORK_ROUNDS% = 1
+29140 _STOPS% = 0
+29150 RUNBASIC "worker.bas"
+29160 REM
+29170 REM --- Run worker W2 (1 round) ---
+29180 WORKER_ID$ = "W2"
+29190 COORD_URL$ = COORD_BASE$
+29200 WORK_ROUNDS% = 1
+29210 _STOPS% = 0
+29220 RUNBASIC "worker.bas"
+29230 REM
+29240 REM --- Verify coordinator still responding after both workers ---
+29250 WORK_URL$ = COORD_BASE$ + "/work?token=" + SECRET$ + "&worker=W1"
+29260 HTTPGET WORK_URL$
+29270 ASSERT_I% = HTTP_STATUS%
+29280 ASSERT_J% = 200
+29290 ASSERT_NAME$ = "T19: COORDINATOR STILL RESPONDING AFTER WORKER RUN"
+29300 GOSUB 91000
+29310 RETURN

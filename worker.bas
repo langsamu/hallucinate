@@ -59,38 +59,56 @@
 2000 REM ================================================================
 2010 REM  SUBROUTINE: ONE COMPLETE WORK ROUND  (GOSUB 2000)
 2020 REM  Gets a work ticket, runs hello.bas, performs 2PC.
-2030 REM ================================================================
-2040 OTELSPAN "worker-round"
-2050 REM --- Get a work ticket from the coordinator ---
-2060 GOSUB 3000
-2070 IF TICKET_OK% = 0 THEN OTELEND
-2075 IF TICKET_OK% = 0 THEN RETURN
-2080 REM --- Run hello.bas for the assigned iteration count ---
-2090 GOSUB 4000
-2100 REM --- 2PC phase 1: ask coordinator to prepare the transaction ---
-2110 GOSUB 5000
-2120 IF VOTE$ = "commit" THEN GOSUB 6000
-2130 IF VOTE$ <> "commit" THEN GOSUB 7000
-2140 OTELEND
-2150 RETURN
+2025 REM
+2026 REM  DISTRIBUTED TRACING: the coordinator embeds a W3C traceparent in
+2027 REM  the /work response (its "hello-world-transaction" root span).  This
+2028 REM  worker extracts that traceparent and starts "worker-round" as a
+2029 REM  cross-service child, so the Jaeger trace shows:
+2030 REM    hello-world-transaction (coordinator)
+2031 REM      worker-round (this worker)
+2032 REM        worker-run-hello -> hello-world-iteration -> ...
+2033 REM ================================================================
+2040 REM --- Get work ticket BEFORE opening worker-round span so we can ---
+2041 REM --- use the coordinator's traceparent as the parent context.    ---
+2042 GOSUB 3000
+2043 IF TICKET_OK% = 0 THEN RETURN
+2044 REM --- Start worker-round as a child of the coordinator's span ---
+2045 OTELSPANWITH "worker-round", TICKET_TRACEPARENT$
+2050 REM --- Log which worker is handling this round ---
+2055 OTELLOG "WORKER ROUND STARTED"
+2060 REM --- Run hello.bas for the assigned iteration count ---
+2065 GOSUB 4000
+2070 REM --- 2PC phase 1: ask coordinator to prepare the transaction ---
+2080 GOSUB 5000
+2090 IF VOTE$ = "commit" THEN GOSUB 6000
+2100 IF VOTE$ <> "commit" THEN GOSUB 7000
+2110 OTELEND
+2120 RETURN
 3000 REM ================================================================
 3010 REM  SUBROUTINE: GET WORK TICKET FROM COORDINATOR  (GOSUB 3000)
 3020 REM  Sets TICKET_OK%=1, TICKET_TID%, TICKET_COUNT% on success.
+3025 REM  Also extracts TICKET_TRACEPARENT$ from the response body so
+3026 REM  the caller can start worker-round as a child of the coordinator's
+3027 REM  hello-world-transaction span.
 3030 REM ================================================================
 3040 OTELSPAN "worker-get-work"
 3050 WORK_URL$ = COORD_URL$ + "/work?token=" + SECRET$ + "&worker=" + WORKER_ID$
 3060 HTTPGET WORK_URL$
 3070 TICKET_OK% = 0
+3075 TICKET_TRACEPARENT$ = ""
 3080 IF INSTR(HTTP_BODY$, "ok=1") = 0 THEN OTELEND
 3085 IF INSTR(HTTP_BODY$, "ok=1") = 0 THEN RETURN
 3090 TICKET_OK% = 1
-3100 REM --- Extract TID from response like "ok=1&tid=42&count=5" ---
+3100 REM --- Extract TID from response like "ok=1&tid=42&count=5&traceparent=..." ---
 3110 P% = INSTR(HTTP_BODY$, "tid=") + 4
 3120 TICKET_TID% = VAL(MID$(HTTP_BODY$, P%, 6))
 3130 REM --- Extract count from response ---
 3140 P% = INSTR(HTTP_BODY$, "count=") + 6
 3150 TICKET_COUNT% = VAL(MID$(HTTP_BODY$, P%, 4))
 3160 IF TICKET_COUNT% = 0 THEN TICKET_COUNT% = 5
+3165 REM --- Extract coordinator traceparent (55-char W3C format) ---
+3166 P% = INSTR(HTTP_BODY$, "traceparent=") + 12
+3167 IF P% > 12 THEN TICKET_TRACEPARENT$ = MID$(HTTP_BODY$, P%, 55)
 3170 OTELEND
 3180 RETURN
 4000 REM ================================================================

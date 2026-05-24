@@ -118,6 +118,58 @@ class _OtelManager:
         except Exception:
             self._span_stack.append((None, None))
 
+    def start_span_with_context(self, name: str, traceparent: str) -> None:
+        """Start a span as a child of a given W3C traceparent string.
+
+        If *traceparent* is the special value "ROOT" or an empty string, the
+        span is started with a brand-new root context (no parent), even if
+        another span is currently active.  This lets the coordinator create
+        an independent ``hello-world-transaction`` span while handling an
+        incoming worker HTTP request.
+
+        For any other non-empty *traceparent*, the W3C context is extracted
+        and used as the parent — enabling cross-service distributed tracing
+        where a worker creates its ``worker-round`` span under the coordinator's
+        transaction span.
+        """
+        self._init()
+        if self._tracer is None:
+            self._span_stack.append((None, None))
+            return
+        try:
+            from opentelemetry import trace, context as otel_context, propagate
+            if not traceparent or traceparent == "ROOT":
+                # Create a fresh root span with no parent context.
+                ctx = trace.set_span_in_context(trace.INVALID_SPAN, otel_context.Context())
+            else:
+                # Extract W3C trace context from the traceparent string.
+                ctx = propagate.extract({"traceparent": traceparent})
+            span = self._tracer.start_span(name, context=ctx)  # type: ignore[union-attr]
+            token = otel_context.attach(trace.set_span_in_context(span))
+            self._span_stack.append((span, token))
+        except Exception:
+            self._span_stack.append((None, None))
+
+    def get_context_str(self) -> str:
+        """Return the W3C traceparent string for the currently active span.
+
+        Returns an empty string when no span is active or when the OTel SDK
+        is not available.  The coordinator uses this to include the current
+        span's traceparent in its /work response body so that workers can
+        start their ``worker-round`` spans as children of the coordinator's
+        ``hello-world-transaction`` span.
+        """
+        self._init()
+        if self._tracer is None:
+            return ""
+        try:
+            from opentelemetry import propagate
+            carrier: dict[str, str] = {}
+            propagate.inject(carrier)
+            return carrier.get("traceparent", "")
+        except Exception:
+            return ""
+
     def end_span(self) -> None:
         """End the most recently started span and restore the previous context."""
         if not self._span_stack:
@@ -606,6 +658,7 @@ class BasicProgram:
             # equivalent to the BASIC emulator for output and variable assertions.
             if (
                 statement.startswith("OTELSPAN ")
+                or statement.startswith("OTELSPANWITH ")
                 or statement == "OTELEND"
                 or statement.startswith("OTELLOG ")
                 or statement.startswith("OTELCOUNT ")
@@ -886,6 +939,18 @@ class BasicRuntime:
             self.pc = self._next_line(self.pc)
             return
 
+        if statement.startswith("OTELSPANWITH "):
+            # OTELSPANWITH "name", traceparent$
+            # Start a span as a child of the given W3C traceparent.
+            # "ROOT" or "" creates a root span with no parent.
+            rest = statement[len("OTELSPANWITH "):].strip()
+            name_expr, ctx_expr = rest.split(",", 1)
+            name = str(self._eval_expr(name_expr.strip()))
+            traceparent = str(self._eval_expr(ctx_expr.strip()))
+            _OTEL.start_span_with_context(name, traceparent)
+            self.pc = self._next_line(self.pc)
+            return
+
         if statement.startswith('OTELLOG "') and statement.endswith('"'):
             # Emit an OTel log record at INFO severity with the given message.
             _OTEL.log(statement[len('OTELLOG "'):-1])
@@ -1027,6 +1092,12 @@ class BasicRuntime:
         # _match_func_call ensures we only match a COMPLETE call (no trailing
         # content), so STR$(X%) in "STR$(X%) + Y$" is NOT matched here —
         # instead it falls through to _top_level_plus_split.
+
+        # OTELCONTEXT$ — returns the W3C traceparent string for the current span.
+        # Used by coordinator to inject its span's traceparent into /work responses
+        # so that workers can start their spans as cross-service children.
+        if expr == "OTELCONTEXT$":
+            return _OTEL.get_context_str()
 
         # STR$(expr) — convert integer to its decimal string
         arg = _match_func_call(expr, "STR$")

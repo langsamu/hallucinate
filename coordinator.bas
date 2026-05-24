@@ -107,11 +107,28 @@
 4000 REM ================================================================
 4010 REM  SUBROUTINE: HANDLE GET /work  (GOSUB 4000)
 4020 REM  Issues a new work ticket (TID + iteration count) to the caller.
-4030 REM ================================================================
+4025 REM
+4026 REM  DISTRIBUTED TRACING: creates a fresh root "hello-world-transaction"
+4027 REM  span (detached from the incoming worker context so it becomes a new
+4028 REM  root trace, not a child of the worker).  The span's W3C traceparent
+4029 REM  is captured via OTELCONTEXT$ and embedded in the response body.
+4030 REM  The worker reads this traceparent and starts its "worker-round"
+4031 REM  span as a cross-service child — producing a single distributed
+4032 REM  trace tree:
+4033 REM    hello-world-transaction (coordinator)
+4034 REM      worker-round (worker-1)
+4035 REM        worker-run-hello -> hello-world-iteration -> ...
+4036 REM      worker-round (worker-2)
+4037 REM        worker-run-hello -> hello-world-iteration -> ...
+4038 REM ================================================================
 4040 TID% = TID% + 1
+4045 REM --- Create a fresh root transaction span (no parent) ---
+4046 OTELSPANWITH "hello-world-transaction", "ROOT"
+4047 TXNCTX$ = OTELCONTEXT$
+4048 OTELEND
 4050 OTELLOG "WORK ASSIGNED"
 4060 OTELCOUNT "coordinator.work_items"
-4070 RESPONSE$ = "ok=1&tid=" + STR$(TID%) + "&count=5"
+4070 RESPONSE$ = "ok=1&tid=" + STR$(TID%) + "&count=5&traceparent=" + TXNCTX$
 4080 RETURN
 5000 REM ================================================================
 5010 REM  SUBROUTINE: HANDLE POST /prepare  (GOSUB 5000)

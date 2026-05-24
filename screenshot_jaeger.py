@@ -1,9 +1,19 @@
 """screenshot_jaeger.py — Capture a screenshot of the Jaeger trace view.
 
-Queries the Jaeger REST API for the hello-bas service, finds the richest
-trace (most spans — the one that best shows the nested span hierarchy),
-then opens that trace in a headless Chromium browser via Playwright and
-saves a PNG screenshot to screenshots/jaeger-trace.png.
+Queries the Jaeger REST API across all known services to find the richest
+distributed trace (most spans), then opens that trace in a headless Chromium
+browser via Playwright and saves a PNG screenshot to screenshots/jaeger-trace.png.
+
+After the coordinator-to-worker traceparent propagation, the ideal trace has:
+  hello-world-transaction (coordinator) ← root span
+    worker-round (worker-1)
+      worker-get-work / worker-run-hello / worker-2pc-prepare / worker-2pc-commit
+      hello-world-iteration x N (from hello.bas via RUNBASIC)
+    worker-round (worker-2)
+      … same structure …
+
+We search across all services (hello-bas, coordinator, worker names) so the
+multi-span root transaction is found regardless of which service owns the most spans.
 
 If the following environment variables are set, the screenshot is also
 uploaded to the PR branch and posted as an embedded-image PR comment:
@@ -44,51 +54,53 @@ def _take_screenshot() -> str | None:
     jaeger = "http://localhost:16686"
 
     # ------------------------------------------------------------------ #
-    # Poll Jaeger REST API for hello-bas traces, with retries.            #
-    # Traces may take several seconds to be forwarded from the OTel       #
-    # Collector to Jaeger after the test run completes.                   #
-    # Poll for up to 60 seconds so we don't screenshot an empty UI.       #
-    # We look for the richest trace (most spans) which will be the        #
-    # distributed worker→coordinator trace after context propagation.     #
+    # Poll Jaeger REST API across all known services for the richest       #
+    # distributed trace (most spans).  Coordinator-to-worker propagation  #
+    # means the hello-world-transaction trace spans multiple services;     #
+    # searching all of them gives us the best chance of finding it.        #
     # ------------------------------------------------------------------ #
-    traces: list = []
-    deadline = time.time() + 60
+    services_to_try = ["hello-bas", "coordinator-bas", "worker-bas"]
+    best_trace: dict | None = None
+    deadline = time.time() + 90
     attempt = 0
     while time.time() < deadline:
         attempt += 1
-        try:
-            resp = requests.get(
-                f"{jaeger}/api/traces",
-                params={"service": "hello-bas", "limit": 50, "lookback": "1h"},
-                timeout=10,
-            )
-            resp.raise_for_status()
-            traces = resp.json().get("data", [])
-            span_counts = [len(t.get("spans", [])) for t in traces]
-            max_spans = max(span_counts, default=0)
-            print(f"Attempt {attempt}: Jaeger returned {len(traces)} trace(s) for hello-bas "
-                  f"(max spans in a single trace: {max_spans})")
-            # Wait until we have at least one trace with multiple spans — the
-            # distributed trace linking worker, coordinator and hello spans.
-            if traces and max_spans >= 3:
-                break
-        except Exception as exc:  # noqa: BLE001
-            print(f"Attempt {attempt}: Could not reach Jaeger API: {exc}")
-        time.sleep(3)
+        max_spans_seen = 0
+        for svc in services_to_try:
+            try:
+                resp = requests.get(
+                    f"{jaeger}/api/traces",
+                    params={"service": svc, "limit": 50, "lookback": "1h"},
+                    timeout=10,
+                )
+                if resp.status_code != 200:
+                    continue
+                traces = resp.json().get("data", [])
+                for t in traces:
+                    sc = len(t.get("spans", []))
+                    if sc > max_spans_seen:
+                        max_spans_seen = sc
+                        best_trace = t
+            except Exception:  # noqa: BLE001
+                pass
+        print(f"Attempt {attempt}: best trace found has {max_spans_seen} span(s)")
+        # Wait for a trace that shows the distributed structure:
+        # at least hello-world-transaction + 2 worker-round + worker-run-hello
+        # spans (i.e., 5+ spans so we know both workers appear).
+        if max_spans_seen >= 5:
+            break
+        time.sleep(5)
 
-    if not traces:
-        print("No traces found in Jaeger after polling — will screenshot the search page")
-
-    # Prefer the trace that has the most spans (best shows nesting).
-    best = max(traces, key=lambda t: len(t.get("spans", [])), default=None)
+    if not best_trace:
+        print("No multi-span distributed trace found — will screenshot the search page")
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch()
         page = browser.new_page(viewport={"width": 1400, "height": 900})
 
-        if best:
-            trace_id = best["traceID"]
-            span_count = len(best.get("spans", []))
+        if best_trace:
+            trace_id = best_trace["traceID"]
+            span_count = len(best_trace.get("spans", []))
             url = f"{jaeger}/trace/{trace_id}"
             print(f"Opening trace {trace_id} ({span_count} spans): {url}")
         else:
@@ -159,7 +171,7 @@ def _publish_pr_comment(screenshot_path: str) -> None:
         print(f"Existing screenshot blob SHA: {existing_sha}")
 
     payload: dict = {
-        "message": "ci: update Jaeger trace screenshot [skip ci]" if existing_sha
+        "message": "ci: update  Jaeger trace screenshot [skip ci]" if existing_sha
                    else "ci: add Jaeger trace screenshot [skip ci]",
         "content": content_b64,
         "branch": branch,
@@ -185,12 +197,13 @@ def _publish_pr_comment(screenshot_path: str) -> None:
     comment_body = (
         "## Jaeger Distributed Trace Visualization\n\n"
         f"![distributed hello-world spans in Jaeger]({image_url})\n\n"
-        "*Distributed trace: `worker-lifecycle` root span (worker.bas) contains "
-        "`worker-round` → `worker-get-work` / `worker-run-hello` / `worker-2pc-prepare` / "
-        "`worker-2pc-commit` child spans; each HTTP call to the coordinator propagates "
-        "W3C trace context so `coordinator-request` spans appear as cross-service "
-        "children, and `hello-world-iteration` grandchildren show the actual "
-        "hello-world computation distributed across the cluster.*"
+        "*Distributed trace: the coordinator's `hello-world-transaction` root span "
+        "contains `worker-round` child spans from multiple workers (W1, W2), each "
+        "containing `worker-run-hello` → `hello-world-iteration` → "
+        "`hello-world-guard` / `hello-world-print` / `hello-world-advance` "
+        "grandchild spans.  Cross-service context propagation via W3C traceparent "
+        "links all worker spans back to a single coordinator-owned transaction, "
+        "showing the distributed hello-world computation in one unified trace tree.*"
     )
     comment_url = f"{api}/repos/{repo}/issues/{pr_number}/comments"
     r = requests.post(
