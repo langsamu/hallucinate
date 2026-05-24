@@ -48,6 +48,8 @@ def _take_screenshot() -> str | None:
     # Traces may take several seconds to be forwarded from the OTel       #
     # Collector to Jaeger after the test run completes.                   #
     # Poll for up to 60 seconds so we don't screenshot an empty UI.       #
+    # We look for the richest trace (most spans) which will be the        #
+    # distributed worker→coordinator trace after context propagation.     #
     # ------------------------------------------------------------------ #
     traces: list = []
     deadline = time.time() + 60
@@ -57,13 +59,18 @@ def _take_screenshot() -> str | None:
         try:
             resp = requests.get(
                 f"{jaeger}/api/traces",
-                params={"service": "hello-bas", "limit": 20, "lookback": "1h"},
+                params={"service": "hello-bas", "limit": 50, "lookback": "1h"},
                 timeout=10,
             )
             resp.raise_for_status()
             traces = resp.json().get("data", [])
-            print(f"Attempt {attempt}: Jaeger returned {len(traces)} trace(s) for hello-bas")
-            if traces:
+            span_counts = [len(t.get("spans", [])) for t in traces]
+            max_spans = max(span_counts, default=0)
+            print(f"Attempt {attempt}: Jaeger returned {len(traces)} trace(s) for hello-bas "
+                  f"(max spans in a single trace: {max_spans})")
+            # Wait until we have at least one trace with multiple spans — the
+            # distributed trace linking worker, coordinator and hello spans.
+            if traces and max_spans >= 3:
                 break
         except Exception as exc:  # noqa: BLE001
             print(f"Attempt {attempt}: Could not reach Jaeger API: {exc}")
@@ -93,11 +100,12 @@ def _take_screenshot() -> str | None:
         except Exception as exc:  # noqa: BLE001
             print(f"Navigation warning (proceeding anyway): {exc}")
 
-        # Give React time to finish rendering the span waterfall.
-        page.wait_for_timeout(5_000)
+        # Give React time to finish rendering the full span waterfall.
+        # Extra time is needed for large distributed traces with many spans.
+        page.wait_for_timeout(8_000)
 
         out = "screenshots/jaeger-trace.png"
-        page.screenshot(path=out, full_page=False)
+        page.screenshot(path=out, full_page=True)
         print(f"Screenshot saved → {out}")
         browser.close()
 
@@ -175,11 +183,14 @@ def _publish_pr_comment(screenshot_path: str) -> None:
     # Step 3 — post the image as a PR comment                             #
     # ------------------------------------------------------------------ #
     comment_body = (
-        "## Jaeger Trace Visualization\n\n"
-        f"![hello-world nested spans in Jaeger]({image_url})\n\n"
-        "*Trace showing `hello-world-iteration` as the root span with "
-        "`hello-world-initialize`, `hello-world-guard`, `hello-world-print`, "
-        "and `hello-world-advance` as nested child spans.*"
+        "## Jaeger Distributed Trace Visualization\n\n"
+        f"![distributed hello-world spans in Jaeger]({image_url})\n\n"
+        "*Distributed trace: `worker-lifecycle` root span (worker.bas) contains "
+        "`worker-round` → `worker-get-work` / `worker-run-hello` / `worker-2pc-prepare` / "
+        "`worker-2pc-commit` child spans; each HTTP call to the coordinator propagates "
+        "W3C trace context so `coordinator-request` spans appear as cross-service "
+        "children, and `hello-world-iteration` grandchildren show the actual "
+        "hello-world computation distributed across the cluster.*"
     )
     comment_url = f"{api}/repos/{repo}/issues/{pr_number}/comments"
     r = requests.post(

@@ -253,14 +253,18 @@ class _HttpServer:
                 length = int(self.headers.get("Content-Length", 0) or 0)
                 body = (self.rfile.read(length).decode("utf-8", errors="replace")
                         if length > 0 else "")
-                # Extract OTel W3C trace-context so incoming spans link correctly.
+                # Extract OTel W3C trace-context from incoming headers and pass it
+                # through the queue so the BASIC execution thread (which calls
+                # HTTPSERVE) can attach it there.  OTel context is thread-local, so
+                # attaching it here (in the server thread) would have no effect on
+                # the BASIC thread that will process the request.
+                incoming_ctx = None
                 try:
                     from opentelemetry.propagate import extract as _ex  # noqa: PLC0415
-                    from opentelemetry import context as _ctx  # noqa: PLC0415
-                    _ctx.attach(_ex({k: v for k, v in self.headers.items()}))
+                    incoming_ctx = _ex({k: v for k, v in self.headers.items()})
                 except Exception:
                     pass
-                rq.put((self.command, self.path, body))
+                rq.put((self.command, self.path, body, incoming_ctx))
                 status, resp_body = rsq.get()
                 resp_bytes = resp_body.encode("utf-8")
                 self.send_response(status)
@@ -282,15 +286,24 @@ class _HttpServer:
                 t.start()
                 self._servers[port] = server
 
-    def accept(self, port: int) -> tuple[str, str, str]:
+    def accept(self, port: int) -> tuple[str, str, str, object]:
         """Block until an HTTP request arrives on *port*.
 
-        Returns ``(verb, path, body)`` and leaves the response slot open until
-        :meth:`respond` is called.
+        Returns ``(verb, path, body, incoming_ctx)`` where *incoming_ctx* is the
+        OTel context extracted from the W3C ``traceparent`` header (or ``None`` if
+        no trace context was present).  The caller (``HTTPSERVE`` handler) must
+        attach *incoming_ctx* in the BASIC execution thread so that subsequent
+        ``OTELSPAN`` calls create spans that are children of the remote caller's
+        span, enabling cross-service distributed tracing.
         """
         self._start_server(port)
         req_q, _ = self._get_or_create_queues(port)
-        return req_q.get()
+        item = req_q.get()
+        # Gracefully handle both old 3-tuple and new 4-tuple items (e.g. from
+        # pre-existing items left in the queue before an upgrade).
+        if len(item) == 4:
+            return item
+        return item[0], item[1], item[2], None
 
     def respond(self, port: int, status: int, body: str) -> None:
         """Send *body* with HTTP *status* to the client waiting on *port*."""
@@ -924,10 +937,21 @@ class BasicRuntime:
         if statement.startswith("HTTPSERVE "):
             port = int(self._eval_expr(statement[len("HTTPSERVE "):].strip()))
             self._current_serve_port = port
-            verb, path, body = _HTTP_SERVER.accept(port)
+            verb, path, body, incoming_ctx = _HTTP_SERVER.accept(port)
             self.vars["HTTP_VERB$"] = verb
             self.vars["HTTP_PATH$"] = path
             self.vars["HTTP_BODY$"] = body
+            # Attach incoming OTel trace context IN THIS (BASIC execution) thread
+            # so that subsequent OTELSPAN calls create child spans under the remote
+            # caller's span.  The token is saved so HTTPRESPOND can detach it,
+            # restoring the previous context after the request has been handled.
+            self._http_serve_ctx_token = None
+            if incoming_ctx is not None:
+                try:
+                    from opentelemetry import context as otel_context
+                    self._http_serve_ctx_token = otel_context.attach(incoming_ctx)
+                except Exception:
+                    pass
             self.pc = self._next_line(self.pc)
             return
 
@@ -938,6 +962,17 @@ class BasicRuntime:
             body = str(self._eval_expr(body_expr.strip()))
             port = getattr(self, "_current_serve_port", 8080)
             _HTTP_SERVER.respond(port, code, body)
+            # Detach the incoming OTel context that was attached by HTTPSERVE,
+            # restoring the execution thread's context to what it was before the
+            # request arrived (so the next HTTPSERVE cycle starts clean).
+            token = getattr(self, "_http_serve_ctx_token", None)
+            if token is not None:
+                try:
+                    from opentelemetry import context as otel_context
+                    otel_context.detach(token)
+                except Exception:
+                    pass
+                self._http_serve_ctx_token = None
             self.pc = self._next_line(self.pc)
             return
 
