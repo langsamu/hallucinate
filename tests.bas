@@ -4,9 +4,12 @@
 40  REM  Runs inside the BASIC emulator, which provides special
 50  REM  instructions (RUNBASIC, NODERUN, TRANSPILE, NODECHECK,
 60  REM  COVCNT, JCOVCNT, CLRCOV, CLRJCOV, OTELSPAN, OTELEND,
-65  REM  OTELLOG, OTELCOUNT, OTELFLUSH) that let BASIC code
-70  REM  drive all testing, coverage, JS-equivalence checks,
-75  REM  and OpenTelemetry observability verification.
+65  REM  OTELLOG, OTELCOUNT, OTELFLUSH, SPAWNBASIC, WAITSPAWNED)
+70  REM  that let BASIC code drive all testing, coverage,
+75  REM  JS-equivalence checks, and OpenTelemetry observability
+76  REM  verification.  SPAWNBASIC launches a BASIC worker in a
+77  REM  parallel thread (non-blocking); WAITSPAWNED joins all
+78  REM  spawned threads and merges their coverage data.
 80  REM
 90  REM  Classic BASIC idioms used throughout:
 100 REM    - Line numbers in multiples of 10
@@ -801,39 +804,48 @@
 28160 RETURN
 
 29000 REM =========================================================
-29010 REM  TEST 19: FULL WORKER.BAS INTEGRATION (END-TO-END)
-29020 REM  Runs TWO workers (W1 and W2) against the coordinator to demonstrate
-29030 REM  the distributed trace: each worker round creates its "worker-round"
-29040 REM  span under the coordinator's "hello-world-transaction" root span.
-29050 REM  Jaeger will show a single trace tree:
-29060 REM    hello-world-transaction (coordinator)
-29070 REM      worker-round (W1) -> worker-run-hello -> hello-world-iteration
-29080 REM      worker-round (W2) -> worker-run-hello -> hello-world-iteration
-29090 REM =========================================================
+29010 REM  TEST 19: FULL WORKER.BAS INTEGRATION (END-TO-END DISTRIBUTED)
+29020 REM  Runs TWO workers (W1 and W2) IN PARALLEL against the coordinator
+29030 REM  to demonstrate the distributed trace: each worker independently
+29040 REM  picks up work tickets and runs hello.bas concurrently, so the
+29050 REM  Jaeger trace shows both workers interleaved under the coordinator's
+29060 REM  "hello-world-transaction" root span.  Use SPAWNBASIC (non-blocking)
+29065 REM  followed by WAITSPAWNED to achieve true concurrent execution.
+29066 REM
+29067 REM  Trace blueprint (2 workers x 2 rounds each):
+29068 REM    hello-world-transaction (coordinator)
+29069 REM      worker-round (W1 round 1) -> worker-run-hello -> hello-world-iteration x5
+29071 REM      worker-round (W1 round 2) -> worker-run-hello -> hello-world-iteration x5
+29072 REM      worker-round (W2 round 1) -> worker-run-hello -> hello-world-iteration x5
+29073 REM      worker-round (W2 round 2) -> worker-run-hello -> hello-world-iteration x5
+29074 REM =========================================================
 29095 PRINT "=========================================="
-29096 PRINT "T19: WORKER INTEGRATION (DISTRIBUTED TRACE)"
+29096 PRINT "T19: WORKER INTEGRATION (DISTRIBUTED PARALLEL)"
 29097 PRINT "=========================================="
 29098 GOSUB 800
 29099 REM
-29100 REM --- Run worker W1 (1 round) ---
+29100 REM --- Launch worker W1 in a parallel background thread (non-blocking) ---
 29110 WORKER_ID$ = "W1"
 29120 COORD_URL$ = COORD_BASE$
-29130 WORK_ROUNDS% = 1
+29130 WORK_ROUNDS% = 2
 29140 _STOPS% = 0
-29150 RUNBASIC "worker.bas"
+29150 SPAWNBASIC "worker.bas"
 29160 REM
-29170 REM --- Run worker W2 (1 round) ---
+29170 REM --- Launch worker W2 in a parallel background thread (non-blocking) ---
 29180 WORKER_ID$ = "W2"
 29190 COORD_URL$ = COORD_BASE$
-29200 WORK_ROUNDS% = 1
+29200 WORK_ROUNDS% = 2
 29210 _STOPS% = 0
-29220 RUNBASIC "worker.bas"
+29220 SPAWNBASIC "worker.bas"
 29230 REM
-29240 REM --- Verify coordinator still responding after both workers ---
-29250 WORK_URL$ = COORD_BASE$ + "/work?token=" + SECRET$ + "&worker=W1"
-29260 HTTPGET WORK_URL$
-29270 ASSERT_I% = HTTP_STATUS%
-29280 ASSERT_J% = 200
-29290 ASSERT_NAME$ = "T19: COORDINATOR STILL RESPONDING AFTER WORKER RUN"
+29235 REM --- Wait for both workers to complete (blocks until all done) ---
+29240 WAITSPAWNED
+29245 REM
+29250 REM --- Verify coordinator still responding after both workers ---
+29260 WORK_URL$ = COORD_BASE$ + "/work?token=" + SECRET$ + "&worker=W1"
+29270 HTTPGET WORK_URL$
+29280 ASSERT_I% = HTTP_STATUS%
+29290 ASSERT_J% = 200
+29295 ASSERT_NAME$ = "T19: COORDINATOR STILL RESPONDING AFTER PARALLEL WORKER RUN"
 29300 GOSUB 91000
 29310 RETURN

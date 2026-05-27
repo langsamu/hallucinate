@@ -63,7 +63,7 @@ def _take_screenshot() -> str | None:
     # means the hello-world-transaction trace spans multiple services;     #
     # searching all of them gives us the best chance of finding it.        #
     # ------------------------------------------------------------------ #
-    services_to_try = ["hello-bas", "coordinator", "worker-W1", "worker-W2"]
+    services_to_try = ["coordinator", "worker-W1", "worker-W2", "hello-bas"]
     best_trace: dict | None = None
     deadline = time.time() + 90
     attempt = 0
@@ -89,22 +89,18 @@ def _take_screenshot() -> str | None:
                 pass
         print(f"Attempt {attempt}: best trace found has {max_spans_seen} span(s)")
         # Wait for a trace that shows the full distributed structure.
-        # After the RUNBASIC span-stack leak fix, the expected distributed
-        # trace (hello-world-transaction root) has ~59 spans per CI run:
+        # With 2 workers (W1 + W2) doing 2 rounds each and 5 hello prints per round:
         #   hello-world-transaction (coordinator, root)         1
-        #   worker-round x2 (W1 + W2, direct children)         2
-        #     worker-get-work x2                                2
-        #       coordinator-request for /work x2               2
-        #     worker-run-hello x2                              2
-        #       hello-world-initialize x2                      2
-        #       hello-world-iteration x2x5=10                 10
-        #         hello-world-{guard,print,advance} x30       30
-        #     worker-2pc-{prepare,commit} x4                   4
-        #       coordinator-request for prepare/commit x4      4
-        # Total: ~59 spans.  W1 alone contributes ~29 spans.
-        # Require ≥ 40 to ensure BOTH workers' spans are present before
-        # the screenshot is taken, preventing a W1-only snapshot.
-        if max_spans_seen >= 40:
+        #   worker-round x4 (W1×2 + W2×2, direct children)     4
+        #     worker-get-work x4                                4
+        #     worker-run-hello x4                               4
+        #       hello-world-iteration x4x5=20                  20
+        #         hello-world-{guard,print,advance} x60        60
+        #     worker-2pc-prepare x4                             4
+        #     worker-2pc-commit x4                              4
+        # Total: ~101 spans.  Require ≥ 80 to ensure multiple workers' spans
+        # are present before the screenshot is taken.
+        if max_spans_seen >= 80:
             break
         time.sleep(5)
 
@@ -216,20 +212,20 @@ def _publish_pr_comment(screenshot_path: str) -> None:
         f"![distributed hello-world spans in Jaeger]({image_url})\n\n"
         "*Distributed trace: the coordinator's `hello-world-transaction` root span "
         "(service: **coordinator**) contains `worker-round` spans from W1 and W2 "
-        "as direct cross-service children (services: **worker-W1**, **worker-W2**), "
-        "each nesting `worker-get-work` → `worker-run-hello` → `hello-world-iteration` → "
-        "`hello-world-guard` / `hello-world-print` / `hello-world-advance` "
-        "grandchild spans (service: **hello-bas**).  "
-        "Cross-service W3C traceparent propagation from the coordinator's "
-        "`/register` response links all worker spans back to a single "
-        "coordinator-owned root, showing the distributed hello-world computation "
-        "in one unified multi-colour trace tree:  \n"
+        "running **in parallel** (services: **worker-W1**, **worker-W2**), "
+        "each doing multiple rounds that nest `worker-get-work` → `worker-run-hello` → "
+        "`hello-world-iteration` → `hello-world-guard` / `hello-world-print` / "
+        "`hello-world-advance` grandchild spans (service: **hello-bas**).  "
+        "W3C traceparent from `/register` links all worker spans back to the "
+        "single coordinator-owned root, showing the distributed hello-world "
+        "computation — with both workers printing hello world concurrently — "
+        "in one unified multi-colour trace waterfall:  \n"
         "`hello-world-transaction` (coordinator)  \n"
-        "├── `worker-round` (worker-W1)  \n"
+        "├── `worker-round` ×2 (worker-W1, 2 rounds)  \n"
         "│   ├── `worker-get-work`  \n"
-        "│   ├── `worker-run-hello` → `hello-world-iteration` (hello-bas)  \n"
+        "│   ├── `worker-run-hello` → `hello-world-iteration` ×5 (hello-bas)  \n"
         "│   └── `worker-2pc-prepare` / `worker-2pc-commit`  \n"
-        "└── `worker-round` (worker-W2)  \n"
+        "└── `worker-round` ×2 (worker-W2, 2 rounds)  \n"
         "    └── … same structure …*"
     )
     comment_url = f"{api}/repos/{repo}/issues/{pr_number}/comments"

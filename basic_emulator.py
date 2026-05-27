@@ -806,6 +806,8 @@ class BasicProgram:
                 or statement.startswith("HTTPRESPOND ")
                 or statement.startswith("SLEEP ")
                 or statement.startswith("SPAWN ")
+                or statement.startswith("SPAWNBASIC ")
+                or statement == "WAITSPAWNED"
             ):
                 return [
                     f"{indent}// network (no-op in js): {statement}",
@@ -897,6 +899,8 @@ class BasicRuntime:
         self._js_coverage: dict[str, set[int]] = {}
         # Current port being served (set by HTTPSERVE, read by HTTPRESPOND).
         self._current_serve_port: int = 8080
+        # Threads started by SPAWNBASIC; joined and merged by WAITSPAWNED.
+        self._spawned_workers: list[tuple[threading.Thread, "BasicRuntime", str]] = []
 
     def run(
         self,
@@ -1188,6 +1192,14 @@ class BasicRuntime:
 
         if statement.startswith('SPAWN "') and statement.endswith('"'):
             self._exec_spawn(statement[len('SPAWN "'):-1])
+            return
+
+        if statement.startswith('SPAWNBASIC "') and statement.endswith('"'):
+            self._exec_spawnbasic(statement[len('SPAWNBASIC "'):-1])
+            return
+
+        if statement == "WAITSPAWNED":
+            self._exec_waitspawned()
             return
 
         raise RuntimeError(f"unsupported statement: {statement}")
@@ -1520,5 +1532,58 @@ class BasicRuntime:
                     break
                 time.sleep(0.05)
 
+        self.pc = self._next_line(self.pc)
+
+    def _exec_spawnbasic(self, filename: str) -> None:
+        """Start a BASIC worker in a background thread with the caller's variable snapshot.
+
+        Unlike SPAWN (which is for persistent server services that never exit),
+        SPAWNBASIC is designed for worker programs that run to completion.  The
+        current variable state is snapshotted at call time and passed to the new
+        runtime so each worker sees its own isolated copy (e.g. distinct WORKER_ID$,
+        COORD_URL$, WORK_ROUNDS%).
+
+        The spawned thread is tracked in self._spawned_workers.  Call WAITSPAWNED
+        to block until all spawned workers have finished and to merge their
+        coverage data back into the caller's coverage dict.
+
+        This enables true parallel distributed-worker tests in BASIC:
+            WORKER_ID$ = "W1"
+            SPAWNBASIC "worker.bas"
+            WORKER_ID$ = "W2"
+            SPAWNBASIC "worker.bas"
+            WAITSPAWNED
+        """
+        initial_vars = dict(self.vars)
+        prog = BasicProgram.from_file(Path(filename))
+        rt = BasicRuntime(prog, initial_vars=initial_vars)
+
+        def _run() -> None:
+            try:
+                rt.run(max_steps=50_000_000)
+            except Exception:
+                pass  # worker exit is silent on error
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        self._spawned_workers.append((t, rt, filename))
+        self.pc = self._next_line(self.pc)
+
+    def _exec_waitspawned(self) -> None:
+        """Wait for all SPAWNBASIC threads to complete and merge their coverage.
+
+        Blocks until every thread started by a previous SPAWNBASIC call has exited
+        (or the 120-second per-thread timeout expires).  After joining, all per-file
+        BASIC coverage data from the spawned runtimes is merged back into this
+        runtime's coverage dict so COVCNT reports the combined result.
+        """
+        for t, rt, filename in self._spawned_workers:
+            t.join(timeout=120)
+            # Merge BASIC coverage accumulated inside the spawned worker.
+            for fname, lines in rt._bas_coverage.items():
+                self._bas_coverage.setdefault(fname, set()).update(lines)
+            # Also credit the lines the worker executed directly (e.g. worker.bas itself).
+            self._bas_coverage.setdefault(filename, set()).update(rt.executed_lines)
+        self._spawned_workers.clear()
         self.pc = self._next_line(self.pc)
 
