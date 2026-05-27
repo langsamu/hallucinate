@@ -88,12 +88,19 @@ def _take_screenshot() -> str | None:
             except Exception:  # noqa: BLE001
                 pass
         print(f"Attempt {attempt}: best trace found has {max_spans_seen} span(s)")
-        # Wait for a trace that shows the full distributed structure:
-        # hello-world-transaction (coordinator) + worker-lifecycle x2 +
-        # worker-register x2 + worker-round x2 + worker-run-hello x2 +
-        # hello-world-iteration x2 + hello-world-* grandchildren x2 + 2PC x4
-        # = well above 10 spans for a proper distributed trace.
-        if max_spans_seen >= 10:
+        # Wait for a trace that shows the full distributed structure.
+        # Blueprint (per worker, 2 workers total):
+        #   hello-world-transaction (coordinator, root)
+        #     worker-round x2       (W1 + W2, direct children)
+        #       worker-get-work x2
+        #       worker-run-hello x2
+        #         hello-world-iteration x2 (hello-bas)
+        #           hello-world-{guard,print,advance} x6
+        #       worker-2pc-{prepare,commit} x4
+        #   + worker-register x2 (own root spans)
+        # Total: 1 + 2 + 2 + 2 + 2 + 6 + 4 + 2 = ~21 spans minimum.
+        # Use 20 as threshold so we capture when both workers are visible.
+        if max_spans_seen >= 20:
             break
         time.sleep(5)
 
@@ -204,15 +211,22 @@ def _publish_pr_comment(screenshot_path: str) -> None:
         "## Jaeger Distributed Trace Visualization\n\n"
         f"![distributed hello-world spans in Jaeger]({image_url})\n\n"
         "*Distributed trace: the coordinator's `hello-world-transaction` root span "
-        "(service: **coordinator**, colour A) contains `worker-lifecycle` child spans "
-        "from W1 (colour B) and W2 (colour C), each nesting `worker-register` → "
-        "`worker-round` → `worker-run-hello` → `hello-world-iteration` → "
+        "(service: **coordinator**) contains `worker-round` spans from W1 and W2 "
+        "as direct cross-service children (services: **worker-W1**, **worker-W2**), "
+        "each nesting `worker-get-work` → `worker-run-hello` → `hello-world-iteration` → "
         "`hello-world-guard` / `hello-world-print` / `hello-world-advance` "
-        "grandchild spans (service: **hello-bas**, colour D).  "
+        "grandchild spans (service: **hello-bas**).  "
         "Cross-service W3C traceparent propagation from the coordinator's "
         "`/register` response links all worker spans back to a single "
         "coordinator-owned root, showing the distributed hello-world computation "
-        "in one unified multi-colour trace tree.*"
+        "in one unified multi-colour trace tree:  \n"
+        "`hello-world-transaction` (coordinator)  \n"
+        "├── `worker-round` (worker-W1)  \n"
+        "│   ├── `worker-get-work`  \n"
+        "│   ├── `worker-run-hello` → `hello-world-iteration` (hello-bas)  \n"
+        "│   └── `worker-2pc-prepare` / `worker-2pc-commit`  \n"
+        "└── `worker-round` (worker-W2)  \n"
+        "    └── … same structure …*"
     )
     comment_url = f"{api}/repos/{repo}/issues/{pr_number}/comments"
     r = requests.post(
