@@ -1358,10 +1358,25 @@ class BasicRuntime:
         # from the worker spans that wrap them.
         saved_service = _OTEL._current_service
         _OTEL._current_service = ""
+        # Record the span stack depth before the sub-program runs.  When
+        # stop_after_prints (or max_steps) terminates execution mid-span —
+        # e.g. PRINT fires at line 2210 and stop_after_prints fires before
+        # OTELEND at line 2215 — the sub-program leaves open spans on the
+        # thread-local stack.  Without cleanup those open spans become the
+        # parent context for the NEXT RUNBASIC call, causing every subsequent
+        # hello.bas test run to nest inside the previous one and creating a
+        # growing mega-trace that overwhelms the coordinator+worker distributed
+        # trace in the Jaeger screenshot.
+        span_depth_before = len(_OTEL._span_stack)
         start, stops, fault_once, initial_vars = self._get_run_params()
         prog = BasicProgram.from_file(Path(filename))
         rt = BasicRuntime(prog, initial_vars=initial_vars, fault_once_lines=fault_once)
         rt.run(max_steps=100000, stop_after_prints=stops, start_line=start)
+        # End any spans the sub-program left open so they don't leak into
+        # the caller's OTel context.  Spans are properly ended (exported)
+        # rather than silently dropped.
+        while len(_OTEL._span_stack) > span_depth_before:
+            _OTEL.end_span()
         _OTEL._current_service = saved_service
         self.vars["B_N%"] = len(rt.output)
         for i in range(9):

@@ -89,18 +89,22 @@ def _take_screenshot() -> str | None:
                 pass
         print(f"Attempt {attempt}: best trace found has {max_spans_seen} span(s)")
         # Wait for a trace that shows the full distributed structure.
-        # Blueprint (per worker, 2 workers total):
-        #   hello-world-transaction (coordinator, root)
-        #     worker-round x2       (W1 + W2, direct children)
-        #       worker-get-work x2
-        #       worker-run-hello x2
-        #         hello-world-iteration x2 (hello-bas)
-        #           hello-world-{guard,print,advance} x6
-        #       worker-2pc-{prepare,commit} x4
-        #   + worker-register x2 (own root spans)
-        # Total: 1 + 2 + 2 + 2 + 2 + 6 + 4 + 2 = ~21 spans minimum.
-        # Use 20 as threshold so we capture when both workers are visible.
-        if max_spans_seen >= 20:
+        # After the RUNBASIC span-stack leak fix, the expected distributed
+        # trace (hello-world-transaction root) has ~59 spans per CI run:
+        #   hello-world-transaction (coordinator, root)         1
+        #   worker-round x2 (W1 + W2, direct children)         2
+        #     worker-get-work x2                                2
+        #       coordinator-request for /work x2               2
+        #     worker-run-hello x2                              2
+        #       hello-world-initialize x2                      2
+        #       hello-world-iteration x2x5=10                 10
+        #         hello-world-{guard,print,advance} x30       30
+        #     worker-2pc-{prepare,commit} x4                   4
+        #       coordinator-request for prepare/commit x4      4
+        # Total: ~59 spans.  W1 alone contributes ~29 spans.
+        # Require ≥ 40 to ensure BOTH workers' spans are present before
+        # the screenshot is taken, preventing a W1-only snapshot.
+        if max_spans_seen >= 40:
             break
         time.sleep(5)
 
