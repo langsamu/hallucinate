@@ -26,18 +26,72 @@ class _OtelManager:
     A single module-level instance is shared across all BasicRuntime objects
     so that spans started by a sub-program (launched via RUNBASIC) are
     correctly nested inside the caller's active context.
+
+    Per-service providers (created by the OTELSERVICE BASIC instruction) let
+    the coordinator and each worker emit spans under distinct service.name
+    values, which causes Jaeger to render them in different colours.  The
+    active service and the span stack are kept in threading.local so the
+    coordinator (background thread) and workers (main thread) each maintain
+    their own independent stacks and service settings.
     """
 
     def __init__(self) -> None:
         self._ready = False
+        # Default providers — service.name from OTEL_SERVICE_NAME env var or "hello-bas".
         self._tracer: object = None
         self._meter: object = None
         self._otel_logger: object = None
         self._tracer_provider: object = None
         self._meter_provider: object = None
         self._logger_provider: object = None
-        self._span_stack: list[object] = []
-        self._counters: dict[str, object] = {}
+        # Per-service providers created by OTELSERVICE; keyed by service name.
+        # Each entry is a 6-tuple: (tracer, tracer_provider, meter, meter_provider,
+        #                           otel_logger, logger_provider).
+        self._service_contexts: dict[str, tuple] = {}
+        # Thread-local storage for the span stack and the active service name.
+        # Using threading.local ensures the coordinator (background thread) and
+        # the workers (main thread) each see their own independent stacks.
+        self._local = threading.local()
+        # Counter objects keyed by (service_key, metric_name) so each service
+        # gets its own counter instrument on the correct MeterProvider.
+        self._counters: dict[tuple, object] = {}
+
+    @property
+    def _span_stack(self) -> list:
+        """Per-thread span stack (LIFO, mirrors OTELSPAN / OTELEND pairs)."""
+        if not hasattr(self._local, "span_stack"):
+            self._local.span_stack = []
+        return self._local.span_stack
+
+    @property
+    def _current_service(self) -> str:
+        """Per-thread active service name.  Empty string means use default provider."""
+        return getattr(self._local, "service", "")
+
+    @_current_service.setter
+    def _current_service(self, value: str) -> None:
+        self._local.service = value
+
+    def _get_tracer(self) -> object:
+        """Return the tracer for the current thread's active service."""
+        svc = self._current_service
+        if svc and svc in self._service_contexts:
+            return self._service_contexts[svc][0]
+        return self._tracer
+
+    def _get_meter(self) -> object:
+        """Return the meter for the current thread's active service."""
+        svc = self._current_service
+        if svc and svc in self._service_contexts:
+            return self._service_contexts[svc][2]
+        return self._meter
+
+    def _get_logger(self) -> object:
+        """Return the OTel logger for the current thread's active service."""
+        svc = self._current_service
+        if svc and svc in self._service_contexts:
+            return self._service_contexts[svc][4]
+        return self._otel_logger
 
     def _init(self) -> None:
         """Lazily initialise the OTel SDK.  Called once on the first OTEL* use."""
@@ -45,7 +99,6 @@ class _OtelManager:
             return
         self._ready = True  # mark ready even on failure so we don't retry
         try:
-            import time as _time
             from opentelemetry import trace, metrics
             from opentelemetry.sdk.trace import TracerProvider
             from opentelemetry.sdk.trace.export import BatchSpanProcessor
@@ -93,6 +146,63 @@ class _OtelManager:
         except Exception:
             pass  # graceful degradation: OTel SDK not installed or misconfigured
 
+    def _init_service(self, service_name: str) -> None:
+        """Create OTel providers for a named service and cache them.
+
+        Called lazily by set_service the first time a service name is encountered.
+        Each service gets its own TracerProvider / MeterProvider / LoggerProvider
+        with the correct ``service.name`` resource so that Jaeger renders spans
+        from each service in a distinct colour.  Subsequent calls for the same
+        service name are no-ops (providers already cached).
+        """
+        if service_name in self._service_contexts:
+            return
+        try:
+            from opentelemetry.sdk.trace import TracerProvider
+            from opentelemetry.sdk.trace.export import BatchSpanProcessor
+            from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+            from opentelemetry.sdk.metrics import MeterProvider
+            from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+            from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+            from opentelemetry.sdk._logs import LoggerProvider
+            from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+            from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
+            from opentelemetry.sdk.resources import Resource
+
+            resource = Resource.create({"service.name": service_name})
+
+            tp = TracerProvider(resource=resource)
+            tp.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+            tracer = tp.get_tracer(service_name)
+
+            reader = PeriodicExportingMetricReader(
+                OTLPMetricExporter(), export_interval_millis=5000
+            )
+            mp = MeterProvider(resource=resource, metric_readers=[reader])
+            meter = mp.get_meter(service_name)
+
+            lp = LoggerProvider(resource=resource)
+            lp.add_log_record_processor(BatchLogRecordProcessor(OTLPLogExporter()))
+            otel_logger = lp.get_logger(service_name)
+
+            self._service_contexts[service_name] = (tracer, tp, meter, mp, otel_logger, lp)
+        except Exception:
+            pass
+
+    def set_service(self, service_name: str) -> None:
+        """Switch this thread's active OTel service for subsequent span / log / metric calls.
+
+        The OTELSERVICE "name" BASIC instruction calls this.  Spans, metrics
+        and logs emitted after this call carry ``service.name=name`` in their
+        resource, which causes Jaeger to render them in a distinct colour from
+        other services.  Each unique service name gets its own providers
+        (cached in _service_contexts); providers are shared safely across
+        threads because they are created before any spans are started.
+        """
+        self._init()
+        self._init_service(service_name)
+        self._current_service = service_name
+
     def start_span(self, name: str) -> None:
         """Start a new trace span nested under the current active span.
 
@@ -103,7 +213,8 @@ class _OtelManager:
         span so end_span can restore the previous context.
         """
         self._init()
-        if self._tracer is None:
+        tracer = self._get_tracer()
+        if tracer is None:
             self._span_stack.append((None, None))
             return
         try:
@@ -111,7 +222,7 @@ class _OtelManager:
             # start_span uses the current context, so it automatically
             # becomes a child of whatever span is currently active.
             ctx = otel_context.get_current()
-            span = self._tracer.start_span(name, context=ctx)  # type: ignore[union-attr]
+            span = tracer.start_span(name, context=ctx)  # type: ignore[union-attr]
             # Activate the new span so the next OTELSPAN call nests inside it.
             token = otel_context.attach(trace.set_span_in_context(span))
             self._span_stack.append((span, token))
@@ -129,11 +240,12 @@ class _OtelManager:
 
         For any other non-empty *traceparent*, the W3C context is extracted
         and used as the parent — enabling cross-service distributed tracing
-        where a worker creates its ``worker-round`` span under the coordinator's
-        transaction span.
+        where a worker creates its ``worker-lifecycle`` span under the
+        coordinator's transaction span.
         """
         self._init()
-        if self._tracer is None:
+        tracer = self._get_tracer()
+        if tracer is None:
             self._span_stack.append((None, None))
             return
         try:
@@ -144,7 +256,7 @@ class _OtelManager:
             else:
                 # Extract W3C trace context from the traceparent string.
                 ctx = propagate.extract({"traceparent": traceparent})
-            span = self._tracer.start_span(name, context=ctx)  # type: ignore[union-attr]
+            span = tracer.start_span(name, context=ctx)  # type: ignore[union-attr]
             token = otel_context.attach(trace.set_span_in_context(span))
             self._span_stack.append((span, token))
         except Exception:
@@ -154,13 +266,12 @@ class _OtelManager:
         """Return the W3C traceparent string for the currently active span.
 
         Returns an empty string when no span is active or when the OTel SDK
-        is not available.  The coordinator uses this to include the current
-        span's traceparent in its /work response body so that workers can
-        start their ``worker-round`` spans as children of the coordinator's
-        ``hello-world-transaction`` span.
+        is not available.  The coordinator uses this to capture the current
+        span's traceparent and embed it in responses so that workers can
+        start their ``worker-lifecycle`` spans as cross-service children.
         """
         self._init()
-        if self._tracer is None:
+        if self._get_tracer() is None:
             return ""
         try:
             from opentelemetry import propagate
@@ -172,9 +283,10 @@ class _OtelManager:
 
     def end_span(self) -> None:
         """End the most recently started span and restore the previous context."""
-        if not self._span_stack:
+        stack = self._span_stack
+        if not stack:
             return
-        entry = self._span_stack.pop()
+        entry = stack.pop()
         span, token = entry if isinstance(entry, tuple) else (entry, None)
         if span is not None:
             try:
@@ -191,13 +303,14 @@ class _OtelManager:
     def log(self, message: str) -> None:
         """Emit an OTel log record at INFO severity."""
         self._init()
-        if self._otel_logger is None:
+        otel_logger = self._get_logger()
+        if otel_logger is None:
             return
         try:
             import time as _time
             from opentelemetry.sdk._logs import LogRecord
             from opentelemetry._logs import SeverityNumber
-            self._otel_logger.emit(
+            otel_logger.emit(
                 LogRecord(
                     timestamp=_time.time_ns(),
                     observed_timestamp=_time.time_ns(),
@@ -217,12 +330,17 @@ class _OtelManager:
     def count(self, metric_name: str, value: int = 1) -> None:
         """Increment a named counter metric by value (default 1)."""
         self._init()
-        if self._meter is None:
+        meter = self._get_meter()
+        if meter is None:
             return
         try:
-            if metric_name not in self._counters:
-                self._counters[metric_name] = self._meter.create_counter(metric_name)  # type: ignore[union-attr]
-            self._counters[metric_name].add(value)  # type: ignore[union-attr]
+            # Key counters by (service, metric_name) so each service gets its
+            # own instrument on the correct MeterProvider.
+            svc = self._current_service or "_default"
+            key = (svc, metric_name)
+            if key not in self._counters:
+                self._counters[key] = meter.create_counter(metric_name)  # type: ignore[union-attr]
+            self._counters[key].add(value)  # type: ignore[union-attr]
         except Exception:
             pass
 
@@ -230,12 +348,21 @@ class _OtelManager:
         """Force-flush all pending OTel signal batches.  Returns True on success."""
         self._init()
         try:
-            if self._tracer_provider is not None:
-                self._tracer_provider.force_flush()  # type: ignore[union-attr]
-            if self._meter_provider is not None:
-                self._meter_provider.force_flush()  # type: ignore[union-attr]
-            if self._logger_provider is not None:
-                self._logger_provider.force_flush()  # type: ignore[union-attr]
+            # Flush the default providers.
+            for p in (self._tracer_provider, self._meter_provider, self._logger_provider):
+                if p is not None:
+                    try:
+                        p.force_flush()  # type: ignore[union-attr]
+                    except Exception:
+                        pass
+            # Flush every per-service provider set.
+            for _tracer, tp, _meter, mp, _logger, lp in self._service_contexts.values():
+                for p in (tp, mp, lp):
+                    if p is not None:
+                        try:
+                            p.force_flush()  # type: ignore[union-attr]
+                        except Exception:
+                            pass
             return True
         except Exception:
             return False
@@ -657,7 +784,8 @@ class BasicProgram:
             # the program counter.  The JS runtime therefore stays behaviourally
             # equivalent to the BASIC emulator for output and variable assertions.
             if (
-                statement.startswith("OTELSPAN ")
+                statement.startswith("OTELSERVICE ")
+                or statement.startswith("OTELSPAN ")
                 or statement.startswith("OTELSPANWITH ")
                 or statement == "OTELEND"
                 or statement.startswith("OTELLOG ")
@@ -926,6 +1054,17 @@ class BasicRuntime:
         # All instructions delegate to the module-level _OTEL singleton so that
         # traces/metrics/logs flow through a single SDK provider regardless of
         # how many BasicRuntime objects are active at the same time.
+
+        if statement.startswith("OTELSERVICE "):
+            # OTELSERVICE "name"
+            # Switch the current thread's active OTel service.  Subsequent spans,
+            # metrics and logs carry service.name=name in their resource so Jaeger
+            # renders them in a distinct colour from other services (coordinator,
+            # worker-W1, worker-W2, hello-bas etc.).
+            svc_expr = statement[len("OTELSERVICE "):].strip()
+            _OTEL.set_service(str(self._eval_expr(svc_expr)))
+            self.pc = self._next_line(self.pc)
+            return
 
         if statement.startswith('OTELSPAN "') and statement.endswith('"'):
             # Start a new trace span with the given name and push it on the stack.
@@ -1208,11 +1347,22 @@ class BasicRuntime:
           B_MSG$        - final value of MESSAGE$ in the sub-program
           B_ITER%       - final value of ITERATION% in the sub-program
         Also accumulates executed line numbers into self._bas_coverage[filename].
+
+        The active OTel service is reset to "" (the default "hello-bas" provider)
+        for the sub-program so that spans emitted by hello.bas always appear under
+        the hello-bas service in Jaeger, regardless of which worker is calling it.
+        The caller's service setting is restored after the sub-program exits.
         """
+        # Save and reset the active service so the sub-program uses the default
+        # hello-bas service.  This ensures hello.bas spans show a distinct colour
+        # from the worker spans that wrap them.
+        saved_service = _OTEL._current_service
+        _OTEL._current_service = ""
         start, stops, fault_once, initial_vars = self._get_run_params()
         prog = BasicProgram.from_file(Path(filename))
         rt = BasicRuntime(prog, initial_vars=initial_vars, fault_once_lines=fault_once)
         rt.run(max_steps=100000, stop_after_prints=stops, start_line=start)
+        _OTEL._current_service = saved_service
         self.vars["B_N%"] = len(rt.output)
         for i in range(9):
             self.vars[f"B_{i + 1}$"] = rt.output[i] if i < len(rt.output) else ""

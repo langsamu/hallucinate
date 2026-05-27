@@ -2,79 +2,100 @@
 20  REM  WORKER.BAS - DISTRIBUTED HELLO WORLD WORKER
 30  REM
 40  REM  Each worker:
-50  REM    1. Registers with the coordinator (POST /register)
-60  REM    2. Requests a work ticket (GET /work)
-70  REM    3. Runs hello.bas for the assigned number of iterations
-80  REM    4. Participates in 2PC: PREPARE → COMMIT (or ABORT on error)
-90  REM    5. Loops back to step 2 until WORK_ROUNDS% rounds done
-100 REM
-110 REM  The worker ID is read from WORKER_ID$ before execution starts.
-120 REM  The coordinator URL is read from COORD_URL$ before execution.
-130 REM  WORK_ROUNDS% controls how many work-tickets to process.
+50  REM    1. Sets its OTel service name (OTELSERVICE "worker-<id>")
+60  REM    2. Registers with the coordinator (POST /register), which
+70  REM       returns the shared hello-world-transaction traceparent
+80  REM    3. Starts "worker-lifecycle" as a cross-service child of the
+90  REM       coordinator's hello-world-transaction span
+100 REM    4. Requests a work ticket (GET /work)
+110 REM    5. Runs hello.bas for the assigned number of iterations
+120 REM    6. Participates in 2PC: PREPARE → COMMIT (or ABORT on error)
+130 REM    7. Loops back to step 4 until WORK_ROUNDS% rounds done
 140 REM
-150 REM  Transport (HTTPPOST, HTTPGET, SLEEP) is provided by the emulator.
-160 REM  All business logic — auth, serialisation, 2PC — lives in BASIC.
-170 REM ================================================================
+150 REM  The worker ID is read from WORKER_ID$ before execution starts.
+160 REM  The coordinator URL is read from COORD_URL$ before execution.
+170 REM  WORK_ROUNDS% controls how many work-tickets to process.
 180 REM
-190 REM  READ CONFIGURATION FROM CALLER-PROVIDED VARIABLES
-200 REM  (Tests set these before RUNBASIC / the Docker entrypoint uses env vars)
-210 IF WORKER_ID$  = "" THEN WORKER_ID$  = "W1"
-220 IF COORD_URL$  = "" THEN COORD_URL$  = "http://localhost:8080"
-230 IF WORK_ROUNDS% = 0 THEN WORK_ROUNDS% = 3
-240 SECRET$ = "BASIC-SECRET"
-250 REM
-260 REM  INITIALISE WORKER TELEMETRY
-270 OTELSPAN "worker-lifecycle"
-280 OTELLOG "WORKER STARTED"
-290 OTELCOUNT "worker.starts"
-300 REM
-310 REM  PHASE 0: REGISTER WITH COORDINATOR
-320 GOSUB 1000
-330 IF REG_OK% = 0 THEN OTELLOG "REGISTRATION FAILED"
-335 IF REG_OK% = 0 THEN OTELEND
-338 IF REG_OK% = 0 THEN END
-340 REM
-350 REM  MAIN WORK LOOP — one round = get ticket, run, 2PC
-360 ROUND% = 0
-370 GOSUB 2000
-380 ROUND% = ROUND% + 1
-390 IF ROUND% < WORK_ROUNDS% THEN GOTO 370
-400 REM
-410 REM  DONE — flush telemetry and exit
-420 OTELEND
-430 OTELFLUSH
-440 END
+190 REM  Transport (HTTPPOST, HTTPGET, SLEEP) is provided by the emulator.
+200 REM  All business logic — auth, serialisation, 2PC — lives in BASIC.
+210 REM ================================================================
+220 REM
+230 REM  READ CONFIGURATION FROM CALLER-PROVIDED VARIABLES
+240 REM  (Tests set these before RUNBASIC / the Docker entrypoint uses env vars)
+250 IF WORKER_ID$  = "" THEN WORKER_ID$  = "W1"
+260 IF COORD_URL$  = "" THEN COORD_URL$  = "http://localhost:8080"
+270 IF WORK_ROUNDS% = 0 THEN WORK_ROUNDS% = 3
+280 SECRET$ = "BASIC-SECRET"
+290 REM
+295 REM  SET OTEL SERVICE NAME FOR THIS WORKER INSTANCE
+296 REM  Each worker ID (W1, W2, ...) becomes a separate service in Jaeger,
+297 REM  rendered in a distinct colour so the distributed trace is clearly
+298 REM  partitioned: coordinator spans (colour A), worker-W1 spans (colour B),
+299 REM  worker-W2 spans (colour C), hello-bas spans (colour D).
+300 OTELSERVICE "worker-" + WORKER_ID$
+310 REM
+320 REM  PHASE 0: REGISTER WITH COORDINATOR
+330 REM  Register first — the response includes the shared hello-world-transaction
+340 REM  traceparent that we need before we can start worker-lifecycle.
+350 GOSUB 1000
+360 IF REG_OK% = 0 THEN END
+370 REM
+380 REM  START WORKER-LIFECYCLE SPAN AS A CROSS-SERVICE CHILD OF THE
+390 REM  COORDINATOR'S hello-world-transaction ROOT SPAN.
+400 REM  Using OTELSPANWITH instead of OTELSPAN means this span appears
+410 REM  under the coordinator's transaction in Jaeger, linking both
+420 REM  workers into one unified distributed trace tree.
+430 OTELSPANWITH "worker-lifecycle", REG_TRACEPARENT$
+440 OTELLOG "WORKER STARTED"
+450 OTELCOUNT "worker.starts"
+460 REM
+470 REM  MAIN WORK LOOP — one round = get ticket, run, 2PC
+480 ROUND% = 0
+490 GOSUB 2000
+500 ROUND% = ROUND% + 1
+510 IF ROUND% < WORK_ROUNDS% THEN GOTO 490
+520 REM
+530 REM  DONE — flush telemetry and exit
+540 OTELEND
+550 OTELFLUSH
+560 END
 1000 REM ================================================================
 1010 REM  SUBROUTINE: REGISTER WITH COORDINATOR  (GOSUB 1000)
 1020 REM  Sets REG_OK% = 1 on success, 0 on failure.
+1025 REM  On success, also sets REG_TRACEPARENT$ to the W3C traceparent
+1026 REM  of the coordinator's hello-world-transaction span so the caller
+1027 REM  can start worker-lifecycle as a cross-service child.
 1030 REM ================================================================
 1040 OTELSPAN "worker-register"
 1050 REG_BODY$ = "token=" + SECRET$ + "&worker=" + WORKER_ID$
 1060 HTTPPOST COORD_URL$ + "/register", REG_BODY$
 1070 REG_OK% = 0
+1075 REG_TRACEPARENT$ = ""
 1080 IF HTTP_STATUS% = 200 THEN REG_OK% = 1
 1090 IF INSTR(HTTP_BODY$, "ok=1") > 0 THEN REG_OK% = 1
+1095 REM --- Extract the transaction traceparent (55-char W3C format) ---
+1096 P% = INSTR(HTTP_BODY$, "traceparent=") + 12
+1097 IF P% > 12 THEN REG_TRACEPARENT$ = MID$(HTTP_BODY$, P%, 55)
 1100 OTELEND
 1110 RETURN
 2000 REM ================================================================
 2010 REM  SUBROUTINE: ONE COMPLETE WORK ROUND  (GOSUB 2000)
 2020 REM  Gets a work ticket, runs hello.bas, performs 2PC.
 2025 REM
-2026 REM  DISTRIBUTED TRACING: the coordinator embeds a W3C traceparent in
-2027 REM  the /work response (its "hello-world-transaction" root span).  This
-2028 REM  worker extracts that traceparent and starts "worker-round" as a
-2029 REM  cross-service child, so the Jaeger trace shows:
-2030 REM    hello-world-transaction (coordinator)
-2031 REM      worker-round (this worker)
-2032 REM        worker-run-hello -> hello-world-iteration -> ...
-2033 REM ================================================================
-2040 REM --- Get work ticket BEFORE opening worker-round span so we can ---
-2041 REM --- use the coordinator's traceparent as the parent context.    ---
-2042 GOSUB 3000
+2026 REM  DISTRIBUTED TRACING: worker-round is started as a plain OTELSPAN
+2027 REM  (no explicit traceparent needed) because worker-lifecycle, which
+2028 REM  is already a cross-service child of hello-world-transaction, is
+2029 REM  the active span context at this point.  Jaeger will show:
+2030 REM    hello-world-transaction  (coordinator)
+2031 REM      worker-lifecycle       (this worker)
+2032 REM        worker-round         (this worker)
+2033 REM          worker-run-hello -> hello-world-iteration (hello-bas)
+2034 REM          worker-2pc-prepare, worker-2pc-commit
+2035 REM ================================================================
+2040 GOSUB 3000
 2043 IF TICKET_OK% = 0 THEN RETURN
-2044 REM --- Start worker-round as a child of the coordinator's span ---
-2045 OTELSPANWITH "worker-round", TICKET_TRACEPARENT$
-2050 REM --- Log which worker is handling this round ---
+2045 REM --- Start worker-round as a child of the active worker-lifecycle span ---
+2046 OTELSPAN "worker-round"
 2055 OTELLOG "WORKER ROUND STARTED"
 2060 REM --- Run hello.bas for the assigned iteration count ---
 2065 GOSUB 4000

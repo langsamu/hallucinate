@@ -36,8 +36,17 @@
 360 PHASE_STATE%  = 0
 370 PHASE_TID%    = 0
 380 PHASE_WORKER$ = ""
-390 REM
-400 REM  EMIT STARTUP TELEMETRY
+385 REM  TXN_TRACEPARENT$ holds the W3C traceparent of the current
+386 REM  hello-world-transaction span, shared across all /work requests.
+387 REM  Created once on the first worker registration; all workers start
+388 REM  their worker-lifecycle spans as cross-service children using it.
+390 TXN_TRACEPARENT$ = ""
+395 REM
+400 REM  IDENTIFY THIS COMPONENT AS THE COORDINATOR SERVICE IN JAEGER
+401 REM  (must be before the first OTELSPAN so the startup span is tagged)
+402 OTELSERVICE "coordinator"
+403 REM
+404 REM  EMIT STARTUP TELEMETRY
 410 OTELSPAN "coordinator-startup"
 420 OTELLOG "COORDINATOR STARTED"
 430 OTELCOUNT "coordinator.starts"
@@ -97,38 +106,54 @@
 3000 REM ================================================================
 3010 REM  SUBROUTINE: HANDLE POST /register  (GOSUB 3000)
 3020 REM  Registers a new worker and returns the current TID seed.
-3030 REM ================================================================
-3040 WORKER_CNT% = WORKER_CNT% + 1
-3050 TID% = TID% + 1
-3060 OTELLOG "WORKER REGISTERED"
-3070 OTELCOUNT "coordinator.workers"
-3080 RESPONSE$ = "ok=1&workers=" + STR$(WORKER_CNT%) + "&tid_seed=" + STR$(TID%)
-3090 RETURN
+3025 REM
+3026 REM  DISTRIBUTED TRACING: on the very first registration, a root
+3027 REM  "hello-world-transaction" span is created under the coordinator
+3028 REM  service.  Its W3C traceparent is stored in TXN_TRACEPARENT$ and
+3029 REM  embedded in the response so workers can start their
+3030 REM  "worker-lifecycle" spans as cross-service children, producing a
+3031 REM  single distributed trace tree:
+3032 REM    hello-world-transaction  (coordinator, colour A)
+3033 REM      worker-lifecycle       (worker-W1,   colour B)
+3034 REM        worker-register      (worker-W1)
+3035 REM        worker-round         (worker-W1)
+3036 REM          worker-run-hello   (worker-W1)
+3037 REM            hello-world-iteration (hello-bas, colour D)
+3038 REM      worker-lifecycle       (worker-W2,   colour C)
+3039 REM        ...
+3040 REM ================================================================
+3050 WORKER_CNT% = WORKER_CNT% + 1
+3060 TID% = TID% + 1
+3070 OTELLOG "WORKER REGISTERED"
+3080 OTELCOUNT "coordinator.workers"
+3090 REM --- Create the shared transaction span on the first registration ---
+3100 IF TXN_TRACEPARENT$ = "" THEN GOSUB 3500
+3110 RESPONSE$ = "ok=1&workers=" + STR$(WORKER_CNT%) + "&tid_seed=" + STR$(TID%) + "&traceparent=" + TXN_TRACEPARENT$
+3120 RETURN
+3500 REM ================================================================
+3510 REM  SUBROUTINE: CREATE HELLO-WORLD-TRANSACTION SPAN  (GOSUB 3500)
+3520 REM  Called once on the first worker registration.  Creates a new
+3530 REM  root span for the entire distributed hello-world transaction
+3540 REM  using the coordinator service, captures its W3C traceparent,
+3550 REM  and immediately ends the span so it is exported to Jaeger.
+3560 REM  Workers receive the traceparent and start their lifecycle spans
+3570 REM  as cross-service children — linking all spans into one trace.
+3580 REM ================================================================
+3590 OTELSPANWITH "hello-world-transaction", "ROOT"
+3600 TXN_TRACEPARENT$ = OTELCONTEXT$
+3610 OTELEND
+3620 OTELLOG "HELLO-WORLD TRANSACTION STARTED"
+3630 RETURN
 4000 REM ================================================================
 4010 REM  SUBROUTINE: HANDLE GET /work  (GOSUB 4000)
 4020 REM  Issues a new work ticket (TID + iteration count) to the caller.
-4025 REM
-4026 REM  DISTRIBUTED TRACING: creates a fresh root "hello-world-transaction"
-4027 REM  span (detached from the incoming worker context so it becomes a new
-4028 REM  root trace, not a child of the worker).  The span's W3C traceparent
-4029 REM  is captured via OTELCONTEXT$ and embedded in the response body.
-4030 REM  The worker reads this traceparent and starts its "worker-round"
-4031 REM  span as a cross-service child — producing a single distributed
-4032 REM  trace tree:
-4033 REM    hello-world-transaction (coordinator)
-4034 REM      worker-round (worker-1)
-4035 REM        worker-run-hello -> hello-world-iteration -> ...
-4036 REM      worker-round (worker-2)
-4037 REM        worker-run-hello -> hello-world-iteration -> ...
-4038 REM ================================================================
+4025 REM  Returns TXN_TRACEPARENT$ so the worker can continue nesting its
+4026 REM  spans under the shared hello-world-transaction root.
+4030 REM ================================================================
 4040 TID% = TID% + 1
-4045 REM --- Create a fresh root transaction span (no parent) ---
-4046 OTELSPANWITH "hello-world-transaction", "ROOT"
-4047 TXNCTX$ = OTELCONTEXT$
-4048 OTELEND
 4050 OTELLOG "WORK ASSIGNED"
 4060 OTELCOUNT "coordinator.work_items"
-4070 RESPONSE$ = "ok=1&tid=" + STR$(TID%) + "&count=5&traceparent=" + TXNCTX$
+4070 RESPONSE$ = "ok=1&tid=" + STR$(TID%) + "&count=5&traceparent=" + TXN_TRACEPARENT$
 4080 RETURN
 5000 REM ================================================================
 5010 REM  SUBROUTINE: HANDLE POST /prepare  (GOSUB 5000)

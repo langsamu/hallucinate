@@ -5,18 +5,22 @@ distributed trace (most spans), then opens that trace in a headless Chromium
 browser via Playwright and saves a PNG screenshot to screenshots/jaeger-trace.png.
 
 After the coordinator-to-worker traceparent propagation, the ideal trace has:
-  hello-world-transaction (coordinator) ← root span
-    worker-round (worker-1)
-      worker-get-work / worker-run-hello / worker-2pc-prepare / worker-2pc-commit
-      hello-world-iteration x N (from hello.bas via RUNBASIC)
-    worker-round (worker-2)
+  hello-world-transaction (coordinator) ← root span, colour A
+    worker-lifecycle (worker-W1)        ← colour B
+      worker-register
+      worker-round
+        worker-get-work
+        worker-run-hello
+          hello-world-iteration (hello-bas)  ← colour D
+            hello-world-guard / hello-world-print / hello-world-advance
+        worker-2pc-prepare / worker-2pc-commit
+    worker-lifecycle (worker-W2)        ← colour C
       … same structure …
 
-We search across all services (hello-bas, coordinator, worker names) so the
-multi-span root transaction is found regardless of which service owns the most spans.
-
-If the following environment variables are set, the screenshot is also
-uploaded to the PR branch and posted as an embedded-image PR comment:
+We search across all services (hello-bas, coordinator, worker-W1, worker-W2)
+so the multi-span root transaction is found regardless of which service owns
+the most spans.  We wait until at least 10 spans appear so the screenshot
+captures the full multi-colour distributed trace waterfall.
   GITHUB_TOKEN       — personal access token or GITHUB_TOKEN secret
   GITHUB_REPOSITORY  — owner/repo (e.g. "langsamu/hallucinate")
   GITHUB_HEAD_REF    — the PR branch name
@@ -59,7 +63,7 @@ def _take_screenshot() -> str | None:
     # means the hello-world-transaction trace spans multiple services;     #
     # searching all of them gives us the best chance of finding it.        #
     # ------------------------------------------------------------------ #
-    services_to_try = ["hello-bas", "coordinator-bas", "worker-bas"]
+    services_to_try = ["hello-bas", "coordinator", "worker-W1", "worker-W2"]
     best_trace: dict | None = None
     deadline = time.time() + 90
     attempt = 0
@@ -84,10 +88,12 @@ def _take_screenshot() -> str | None:
             except Exception:  # noqa: BLE001
                 pass
         print(f"Attempt {attempt}: best trace found has {max_spans_seen} span(s)")
-        # Wait for a trace that shows the distributed structure:
-        # at least hello-world-transaction + 2 worker-round + worker-run-hello
-        # spans (i.e., 5+ spans so we know both workers appear).
-        if max_spans_seen >= 5:
+        # Wait for a trace that shows the full distributed structure:
+        # hello-world-transaction (coordinator) + worker-lifecycle x2 +
+        # worker-register x2 + worker-round x2 + worker-run-hello x2 +
+        # hello-world-iteration x2 + hello-world-* grandchildren x2 + 2PC x4
+        # = well above 10 spans for a proper distributed trace.
+        if max_spans_seen >= 10:
             break
         time.sleep(5)
 
@@ -198,12 +204,15 @@ def _publish_pr_comment(screenshot_path: str) -> None:
         "## Jaeger Distributed Trace Visualization\n\n"
         f"![distributed hello-world spans in Jaeger]({image_url})\n\n"
         "*Distributed trace: the coordinator's `hello-world-transaction` root span "
-        "contains `worker-round` child spans from multiple workers (W1, W2), each "
-        "containing `worker-run-hello` → `hello-world-iteration` → "
+        "(service: **coordinator**, colour A) contains `worker-lifecycle` child spans "
+        "from W1 (colour B) and W2 (colour C), each nesting `worker-register` → "
+        "`worker-round` → `worker-run-hello` → `hello-world-iteration` → "
         "`hello-world-guard` / `hello-world-print` / `hello-world-advance` "
-        "grandchild spans.  Cross-service context propagation via W3C traceparent "
-        "links all worker spans back to a single coordinator-owned transaction, "
-        "showing the distributed hello-world computation in one unified trace tree.*"
+        "grandchild spans (service: **hello-bas**, colour D).  "
+        "Cross-service W3C traceparent propagation from the coordinator's "
+        "`/register` response links all worker spans back to a single "
+        "coordinator-owned root, showing the distributed hello-world computation "
+        "in one unified multi-colour trace tree.*"
     )
     comment_url = f"{api}/repos/{repo}/issues/{pr_number}/comments"
     r = requests.post(
