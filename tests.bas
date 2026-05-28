@@ -56,7 +56,7 @@
 490 PRINT "ENTERPRISE HELLO.BAS TEST SUITE"
 500 PRINT "=========================================="
 
-54 REM --- DISPATCH: RUN ALL TEST CASES (T1-T10 original, T11-T19 distributed) ---
+54 REM --- DISPATCH: RUN ALL TEST CASES (T1-T10 original, T11-T19 distributed, T20-T21 performance) ---
 520 GOSUB 1000
 530 GOSUB 2000
 540 GOSUB 3000
@@ -596,7 +596,7 @@
 15190 RETURN
 
 20000 REM =========================================================
-20010 REM  DISTRIBUTED CLUSTER TESTS (T11-T19)
+20010 REM  DISTRIBUTED CLUSTER TESTS (T11-T19) AND PERFORMANCE TESTS (T20-T21)
 20020 REM
 20030 REM  These tests spin up coordinator.bas as a background HTTP
 20040 REM  server via SPAWN, then exercise every route and branch
@@ -614,6 +614,10 @@
 20160 REM    T17 - 2PC ABORT accepted
 20170 REM    T18 - Unknown path returns 404
 20180 REM    T19 - Full worker.bas integration (end-to-end)
+20185 REM    T20 - Performance baseline: 1 worker x PERF_ROUNDS% rounds
+20186 REM    T21 - Performance multi-worker: 2 workers x (PERF_ROUNDS%/2) rounds
+20187 REM          each — same total work, expected to complete faster than T20
+20188 REM          due to horizontal scale-out and parallel hello.bas execution
 20190 REM =========================================================
 20200 COORD_PORT% = 8080
 20210 COORD_BASE$ = "http://localhost:8080"
@@ -631,7 +635,8 @@
 20330 GOSUB 27000
 20340 GOSUB 28000
 20350 GOSUB 29000
-20360 RETURN
+20360 GOSUB 30000
+20370 RETURN
 
 21000 REM =========================================================
 21010 REM  TEST 11: COORDINATOR STARTS AND ACCEPTS CONNECTIONS
@@ -848,3 +853,90 @@
 29295 ASSERT_NAME$ = "T19: COORDINATOR STILL RESPONDING AFTER PARALLEL WORKER RUN"
 29300 GOSUB 91000
 29310 RETURN
+
+30000 REM =========================================================
+30010 REM  PERFORMANCE TESTS (T20-T21)
+30015 REM  Establishes a single-worker baseline (T20), then runs the
+30016 REM  same total workload split across two parallel workers (T21)
+30017 REM  to demonstrate horizontal scale-out.  All timing spans are
+30018 REM  emitted under service "perf-test" so they appear in their
+30019 REM  own compact Jaeger trace (not nested in the main transaction).
+30020 REM =========================================================
+30030 PERF_ROUNDS% = 20
+30040 PRINT "=========================================="
+30045 PRINT "PERFORMANCE TESTS (T20-T21)"
+30050 PRINT "=========================================="
+30060 OTELSERVICE "perf-test"
+30070 OTELSPANWITH "perf-test-suite", "ROOT"
+30080 GOSUB 31000
+30090 GOSUB 32000
+30100 OTELEND
+30110 OTELFLUSH
+30120 RETURN
+
+31000 REM =========================================================
+31010 REM  TEST 20: PERFORMANCE BASELINE (1 WORKER)
+31015 REM  Runs PERF_ROUNDS% complete work rounds on a single worker
+31016 REM  and records elapsed wall-clock time into SINGLE_MS%.
+31020 REM  TICKMS% returns current time in milliseconds (Unix epoch).
+31030 REM =========================================================
+31040 PRINT "=========================================="
+31050 PRINT "T20: PERFORMANCE BASELINE (1 WORKER)"
+31060 PRINT "=========================================="
+31070 OTELSPAN "perf-baseline"
+31080 START_MS% = TICKMS%
+31090 WORKER_ID$ = "W1"
+31100 COORD_URL$ = COORD_BASE$
+31110 WORK_ROUNDS% = PERF_ROUNDS%
+31120 _STOPS% = 0
+31130 SPAWNBASIC "worker.bas"
+31140 WAITSPAWNED
+31150 END_MS% = TICKMS%
+31160 SINGLE_MS% = END_MS% - START_MS%
+31170 OTELLOG "PERF BASELINE: 1 worker, " + STR$(PERF_ROUNDS%) + " rounds, " + STR$(SINGLE_MS%) + " ms"
+31180 OTELEND
+31190 PRINT "T20: 1 WORKER x " + STR$(PERF_ROUNDS%) + " ROUNDS = " + STR$(SINGLE_MS%) + " ms"
+31200 ASSERT_I% = 0
+31205 IF SINGLE_MS% > 0 THEN ASSERT_I% = 1
+31210 ASSERT_J% = 1
+31220 ASSERT_NAME$ = "T20: PERF BASELINE COMPLETED"
+31230 GOSUB 91000
+31240 RETURN
+
+32000 REM =========================================================
+32010 REM  TEST 21: PERFORMANCE MULTI-WORKER (2 WORKERS IN PARALLEL)
+32015 REM  Runs the same total work as T20 but split across two
+32016 REM  parallel workers (PERF_ROUNDS% / 2 rounds each).
+32017 REM  Both workers are launched via SPAWNBASIC so hello.bas
+32018 REM  runs concurrently, demonstrating horizontal scale-out.
+32019 REM  Prints speedup relative to the T20 baseline.
+32020 REM =========================================================
+32030 PRINT "=========================================="
+32040 PRINT "T21: PERFORMANCE MULTI-WORKER (2 WORKERS)"
+32050 PRINT "=========================================="
+32060 HALF_ROUNDS% = 10
+32070 OTELSPAN "perf-multi-worker"
+32080 START_MS% = TICKMS%
+32090 WORKER_ID$ = "W1"
+32100 COORD_URL$ = COORD_BASE$
+32110 WORK_ROUNDS% = HALF_ROUNDS%
+32120 _STOPS% = 0
+32130 SPAWNBASIC "worker.bas"
+32140 WORKER_ID$ = "W2"
+32150 COORD_URL$ = COORD_BASE$
+32160 WORK_ROUNDS% = HALF_ROUNDS%
+32170 _STOPS% = 0
+32180 SPAWNBASIC "worker.bas"
+32190 WAITSPAWNED
+32200 END_MS% = TICKMS%
+32210 MULTI_MS% = END_MS% - START_MS%
+32220 OTELLOG "PERF MULTI-WORKER: 2 workers, " + STR$(HALF_ROUNDS%) + " rounds ea, " + STR$(MULTI_MS%) + " ms"
+32230 OTELEND
+32240 PRINT "T21: 2 WORKERS x " + STR$(HALF_ROUNDS%) + " ROUNDS = " + STR$(MULTI_MS%) + " ms"
+32250 PRINT "     SPEEDUP vs BASELINE: " + STR$(SINGLE_MS%) + " ms -> " + STR$(MULTI_MS%) + " ms"
+32260 ASSERT_I% = 0
+32265 IF MULTI_MS% > 0 THEN ASSERT_I% = 1
+32270 ASSERT_J% = 1
+32280 ASSERT_NAME$ = "T21: MULTI-WORKER PERF TEST COMPLETED"
+32290 GOSUB 91000
+32300 RETURN

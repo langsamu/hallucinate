@@ -533,6 +533,34 @@ def _top_level_plus_split(expr: str) -> tuple[str, str] | None:
     return None
 
 
+def _top_level_minus_split(expr: str) -> tuple[str, str] | None:
+    """Split *expr* at the last ``-`` that is not inside parentheses or a
+    double-quoted string literal, and is not the first character (no unary minus).
+
+    Splitting at the *last* top-level ``-`` gives correct left-to-right
+    associativity: ``A - B - C`` → left=``A - B``, right=``C`` → ``(A-B)-C``.
+    Returns ``(left, right)`` or ``None`` if no such ``-`` exists.
+    """
+    depth = 0
+    in_str = False
+    last_pos: int | None = None
+    for i, ch in enumerate(expr):
+        if ch == '"' and not in_str:
+            in_str = True
+        elif ch == '"' and in_str:
+            in_str = False
+        elif not in_str:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            elif ch == "-" and depth == 0 and i > 0:
+                last_pos = i
+    if last_pos is not None:
+        return expr[:last_pos], expr[last_pos + 1:]
+    return None
+
+
 def _match_func_call(expr: str, name: str) -> str | None:
     """If *expr* is exactly a call to function *name* with balanced parentheses,
     return the argument string (everything between the outer parens).
@@ -1250,6 +1278,14 @@ class BasicRuntime:
         if expr == "OTELCONTEXT$":
             return _OTEL.get_context_str()
 
+        # TICKMS% — current wall-clock time in milliseconds since the Unix epoch.
+        # Useful for measuring elapsed time between two calls:
+        #   START_MS% = TICKMS%
+        #   ... do work ...
+        #   ELAPSED_MS% = TICKMS% - START_MS%
+        if expr == "TICKMS%":
+            return int(time.time() * 1000)
+
         # STR$(expr) — convert integer to its decimal string
         arg = _match_func_call(expr, "STR$")
         if arg is not None:
@@ -1315,6 +1351,16 @@ class BasicRuntime:
             if isinstance(lv, str) or isinstance(rv, str):
                 return str(lv) + str(rv)
             return int(lv) + int(rv)
+
+        # ---- - operator: integer subtraction --------------------------------
+        # Evaluated after + so that "A + B - C" is not mishandled.
+        # Split at the last top-level - for left-to-right associativity.
+        spl_m = _top_level_minus_split(expr)
+        if spl_m is not None:
+            left, right = spl_m
+            lv = self._eval_expr(left.strip())
+            rv = self._eval_expr(right.strip())
+            return int(lv) - int(rv)
 
         if expr in self.vars:
             return self.vars[expr]
