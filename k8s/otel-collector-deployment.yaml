@@ -1,0 +1,44 @@
+# k8s/otel-collector-deployment.yaml
+#
+# Deploys the OpenTelemetry Collector in the cluster.
+# Receives OTLP/HTTP signals from all pods on port 4318 and forwards
+# traces to the Jaeger service on port 4317 (gRPC OTLP).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector
+  labels:
+    app: otel-collector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: otel-collector
+  template:
+    metadata:
+      labels:
+        app: otel-collector
+    spec:
+      containers:
+        - name: otel-collector
+          image: otel/opentelemetry-collector-contrib:0.100.0
+          args:
+            - "--config=/etc/otelcol-contrib/config.yaml"
+          ports:
+            - containerPort: 4318    # OTLP HTTP receiver
+            - containerPort: 13133   # health_check extension
+          volumeMounts:
+            - name: config
+              mountPath: /etc/otelcol-contrib/config.yaml
+              subPath: config.yaml
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 13133
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 12
+      volumes:
+        - name: config
+          configMap:
+            name: otel-collector-config

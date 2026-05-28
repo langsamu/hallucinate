@@ -129,7 +129,11 @@ def _take_screenshot() -> str | None:
         # Extra time is needed for large distributed traces with many spans.
         page.wait_for_timeout(8_000)
 
-        out = "screenshots/jaeger-trace.png"
+        context_label = os.environ.get("CONTEXT_LABEL", "")
+        if context_label:
+            out = f"screenshots/jaeger-{context_label.lower()}-trace.png"
+        else:
+            out = "screenshots/jaeger-trace.png"
         page.screenshot(path=out, full_page=True)
         print(f"Screenshot saved → {out}")
         browser.close()
@@ -163,7 +167,7 @@ def _publish_pr_comment(screenshot_path: str) -> None:
         "X-GitHub-Api-Version": "2022-11-28",
     }
     api = "https://api.github.com"
-    file_path = "screenshots/jaeger-trace.png"
+    file_path = screenshot_path  # use the path returned by _take_screenshot()
 
     # ------------------------------------------------------------------ #
     # Step 1 — read and base64-encode the PNG                             #
@@ -207,8 +211,10 @@ def _publish_pr_comment(screenshot_path: str) -> None:
     # ------------------------------------------------------------------ #
     # Step 3 — post the image as a PR comment                             #
     # ------------------------------------------------------------------ #
+    context_label = os.environ.get("CONTEXT_LABEL", "")
+    title_suffix = f" ({context_label})" if context_label else ""
     comment_body = (
-        "## Jaeger Distributed Trace Visualization\n\n"
+        f"## Jaeger Distributed Trace Visualization{title_suffix}\n\n"
         f"![distributed hello-world spans in Jaeger]({image_url})\n\n"
         "*Distributed trace: the coordinator's `hello-world-transaction` root span "
         "(service: **coordinator**) contains `worker-round` spans from W1 and W2 "

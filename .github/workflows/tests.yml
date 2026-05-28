@@ -146,3 +146,121 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
+  k8s-integration:
+    runs-on: ubuntu-latest
+    # Run the full distributed scenario inside a real Kubernetes cluster.
+    # Two worker pods (W1 and W2) and one coordinator pod are deployed via
+    # kind; all pods emit OTLP spans to an in-cluster OTel Collector which
+    # forwards them to Jaeger.  The Jaeger UI is port-forwarded to the
+    # runner and a screenshot of the distributed trace waterfall is taken
+    # and posted as a PR comment.
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install kind
+        run: |
+          curl -Lo /tmp/kind https://kind.sigs.k8s.io/dl/v0.23.0/kind-linux-amd64
+          chmod +x /tmp/kind
+          sudo mv /tmp/kind /usr/local/bin/kind
+          kind version
+
+      - name: Create kind cluster
+        run: kind create cluster --name hello-bas --wait 60s
+
+      - name: Build and load Docker image into kind
+        run: |
+          docker build -t hello-bas:latest .
+          kind load docker-image hello-bas:latest --name hello-bas
+
+      - name: Deploy OTel infrastructure (Collector + Jaeger)
+        run: |
+          kubectl apply -f k8s/otel-collector-configmap.yaml
+          kubectl apply -f k8s/configmap.yaml
+          kubectl apply -f k8s/otel-collector-deployment.yaml
+          kubectl apply -f k8s/otel-collector-service.yaml
+          kubectl apply -f k8s/jaeger-deployment.yaml
+          kubectl apply -f k8s/jaeger-service.yaml
+
+      - name: Deploy coordinator
+        run: |
+          kubectl apply -f k8s/coordinator-deployment.yaml
+          kubectl apply -f k8s/coordinator-service.yaml
+
+      - name: Wait for infrastructure to be ready
+        run: |
+          kubectl rollout status deployment/otel-collector --timeout=120s
+          kubectl rollout status deployment/jaeger --timeout=120s
+          kubectl rollout status deployment/coordinator --timeout=120s
+
+      - name: Deploy worker Jobs (W1 and W2 in parallel)
+        run: |
+          kubectl apply -f k8s/worker-1-job.yaml
+          kubectl apply -f k8s/worker-2-job.yaml
+
+      - name: Wait for worker Jobs to complete
+        run: |
+          kubectl wait --for=condition=complete job/worker-1 --timeout=180s
+          kubectl wait --for=condition=complete job/worker-2 --timeout=180s
+
+      - name: Port-forward Jaeger UI to localhost:16686
+        run: |
+          kubectl port-forward service/jaeger 16686:16686 &
+          echo "Waiting for Jaeger port-forward to be ready..."
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:16686/ > /dev/null 2>&1; then
+              echo "Jaeger UI ready at http://localhost:16686"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Screenshot Jaeger (k8s) and post as PR comment
+        # Takes a screenshot of the Jaeger distributed trace from the k8s
+        # cluster and posts it as a labelled PR comment.
+        if: always()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_HEAD_REF: ${{ github.head_ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          CONTEXT_LABEL: "Kubernetes"
+        run: |
+          pip install playwright requests
+          playwright install chromium --with-deps
+          python screenshot_jaeger.py
+
+      - name: Collect pod logs
+        if: always()
+        run: |
+          echo "=== OTel Collector logs ==="
+          kubectl logs -l app=otel-collector --tail=100 2>/dev/null || true
+          echo "=== Coordinator logs ==="
+          kubectl logs -l app=coordinator --tail=50 2>/dev/null || true
+          echo "=== Worker-1 logs ==="
+          kubectl logs job/worker-1 --tail=50 2>/dev/null || true
+          echo "=== Worker-2 logs ==="
+          kubectl logs job/worker-2 --tail=50 2>/dev/null || true
+
+      - name: Stop port-forward and delete kind cluster
+        if: always()
+        run: |
+          pkill -f "kubectl port-forward" 2>/dev/null || true
+          kind delete cluster --name hello-bas || true
+
+      - name: Upload Jaeger screenshot (k8s) as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jaeger-k8s-trace-screenshot
+          path: screenshots/jaeger-kubernetes-trace.png
+          if-no-files-found: warn
+          retention-days: 30
+

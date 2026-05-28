@@ -1,0 +1,48 @@
+# k8s/otel-collector-configmap.yaml
+#
+# OpenTelemetry Collector configuration for the in-cluster deployment.
+# Receives OTLP/HTTP signals from coordinator and worker pods on port 4318,
+# then exports them to:
+#   debug       — prints signals to the collector's stdout (visible via kubectl logs)
+#   otlp/jaeger — forwards traces to the Jaeger service on port 4317 (gRPC OTLP)
+#
+# No file exporter is used here because cluster pods do not have a shared
+# persistent volume; traces are visible in the Jaeger UI (port-forwarded to
+# the CI runner for the screenshot) and via collector pod logs.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-config
+data:
+  config.yaml: |
+    extensions:
+      health_check:
+        endpoint: "0.0.0.0:13133"
+
+    receivers:
+      otlp:
+        protocols:
+          http:
+            endpoint: "0.0.0.0:4318"
+
+    exporters:
+      debug:
+        verbosity: detailed
+
+      otlp/jaeger:
+        endpoint: "jaeger:4317"
+        tls:
+          insecure: true
+
+    service:
+      extensions: [health_check]
+      pipelines:
+        traces:
+          receivers: [otlp]
+          exporters: [debug, otlp/jaeger]
+        metrics:
+          receivers: [otlp]
+          exporters: [debug]
+        logs:
+          receivers: [otlp]
+          exporters: [debug]

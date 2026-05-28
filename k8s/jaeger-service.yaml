@@ -1,0 +1,19 @@
+# k8s/jaeger-service.yaml
+#
+# ClusterIP service for Jaeger:
+#   port 16686 — UI (port-forwarded to the runner for screenshot)
+#   port 4317  — OTLP gRPC (OTel Collector sends traces here)
+apiVersion: v1
+kind: Service
+metadata:
+  name: jaeger
+spec:
+  selector:
+    app: jaeger
+  ports:
+    - name: ui
+      port: 16686
+      targetPort: 16686
+    - name: otlp-grpc
+      port: 4317
+      targetPort: 4317

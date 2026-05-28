@@ -1,0 +1,41 @@
+# k8s/worker-2-job.yaml
+#
+# Kubernetes Job for hello-world worker W2.
+# Identical to worker-1-job.yaml but with WORKER_ID=W2 and
+# OTEL_SERVICE_NAME=worker-W2, so its spans appear under a distinct
+# service colour in the Jaeger distributed trace waterfall.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: worker-2
+  labels:
+    app: worker
+    worker-id: W2
+spec:
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        app: worker
+        worker-id: W2
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: worker
+          image: hello-bas:latest
+          imagePullPolicy: Never
+          args: ["worker.bas"]
+          env:
+            - name: OTEL_SERVICE_NAME
+              value: worker-W2
+            - name: WORKER_ID
+              value: W2
+            - name: COORD_URL
+              value: http://coordinator:8080
+            - name: WORK_ROUNDS
+              value: "2"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              valueFrom:
+                configMapKeyRef:
+                  name: hello-bas-config
+                  key: otel_endpoint

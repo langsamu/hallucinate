@@ -23,6 +23,7 @@ spec:
       containers:
         - name: coordinator
           image: hello-bas:latest
+          imagePullPolicy: Never
           args: ["coordinator.bas"]
           ports:
             - containerPort: 8080

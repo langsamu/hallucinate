@@ -1,0 +1,42 @@
+# k8s/worker-1-job.yaml
+#
+# Kubernetes Job for hello-world worker W1.
+# Runs WORK_ROUNDS rounds: register → get ticket → run hello.bas → 2PC.
+# Exits cleanly when all rounds are complete, so the Job reaches Completed.
+# Spans are emitted to the otel-collector service under service.name=worker-W1,
+# making this worker appear in a distinct colour in the Jaeger trace waterfall.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: worker-1
+  labels:
+    app: worker
+    worker-id: W1
+spec:
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        app: worker
+        worker-id: W1
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: worker
+          image: hello-bas:latest
+          imagePullPolicy: Never
+          args: ["worker.bas"]
+          env:
+            - name: OTEL_SERVICE_NAME
+              value: worker-W1
+            - name: WORKER_ID
+              value: W1
+            - name: COORD_URL
+              value: http://coordinator:8080
+            - name: WORK_ROUNDS
+              value: "2"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              valueFrom:
+                configMapKeyRef:
+                  name: hello-bas-config
+                  key: otel_endpoint
