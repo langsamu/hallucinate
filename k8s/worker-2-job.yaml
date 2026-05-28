@@ -33,7 +33,7 @@ spec:
             - name: COORD_URL
               value: http://coordinator:8080
             - name: WORK_ROUNDS
-              value: "2"
+              value: "10"
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               valueFrom:
                 configMapKeyRef:

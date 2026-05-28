@@ -812,12 +812,11 @@
 29060 REM  "hello-world-transaction" root span.  Use SPAWNBASIC (non-blocking)
 29065 REM  followed by WAITSPAWNED to achieve true concurrent execution.
 29066 REM
-29067 REM  Trace blueprint (2 workers x 2 rounds each):
+29067 REM  Trace blueprint (2 workers x 10 rounds each, non-deterministically interleaved):
 29068 REM    hello-world-transaction (coordinator)
-29069 REM      worker-round (W1 round 1) -> worker-run-hello -> hello-world-iteration x5
-29071 REM      worker-round (W1 round 2) -> worker-run-hello -> hello-world-iteration x5
-29072 REM      worker-round (W2 round 1) -> worker-run-hello -> hello-world-iteration x5
-29073 REM      worker-round (W2 round 2) -> worker-run-hello -> hello-world-iteration x5
+29069 REM      worker-round (W1 round 1..10, interleaved with W2) -> hello-world-iteration x5
+29071 REM      worker-round (W2 round 1..10, interleaved with W1) -> hello-world-iteration x5
+29072 REM  W1 and W2 compete for work tickets concurrently; the order is non-deterministic.
 29074 REM =========================================================
 29095 PRINT "=========================================="
 29096 PRINT "T19: WORKER INTEGRATION (DISTRIBUTED PARALLEL)"
@@ -827,14 +826,14 @@
 29100 REM --- Launch worker W1 in a parallel background thread (non-blocking) ---
 29110 WORKER_ID$ = "W1"
 29120 COORD_URL$ = COORD_BASE$
-29130 WORK_ROUNDS% = 2
+29130 WORK_ROUNDS% = 10
 29140 _STOPS% = 0
 29150 SPAWNBASIC "worker.bas"
 29160 REM
 29170 REM --- Launch worker W2 in a parallel background thread (non-blocking) ---
 29180 WORKER_ID$ = "W2"
 29190 COORD_URL$ = COORD_BASE$
-29200 WORK_ROUNDS% = 2
+29200 WORK_ROUNDS% = 10
 29210 _STOPS% = 0
 29220 SPAWNBASIC "worker.bas"
 29230 REM

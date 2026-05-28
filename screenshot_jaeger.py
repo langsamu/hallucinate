@@ -65,7 +65,7 @@ def _take_screenshot() -> str | None:
     # ------------------------------------------------------------------ #
     services_to_try = ["coordinator", "worker-W1", "worker-W2", "hello-bas"]
     best_trace: dict | None = None
-    deadline = time.time() + 90
+    deadline = time.time() + 180
     attempt = 0
     while time.time() < deadline:
         attempt += 1
@@ -89,18 +89,18 @@ def _take_screenshot() -> str | None:
                 pass
         print(f"Attempt {attempt}: best trace found has {max_spans_seen} span(s)")
         # Wait for a trace that shows the full distributed structure.
-        # With 2 workers (W1 + W2) doing 2 rounds each and 5 hello prints per round:
-        #   hello-world-transaction (coordinator, root)         1
-        #   worker-round x4 (W1×2 + W2×2, direct children)     4
-        #     worker-get-work x4                                4
-        #     worker-run-hello x4                               4
-        #       hello-world-iteration x4x5=20                  20
-        #         hello-world-{guard,print,advance} x60        60
-        #     worker-2pc-prepare x4                             4
-        #     worker-2pc-commit x4                              4
-        # Total: ~101 spans.  Require ≥ 80 to ensure multiple workers' spans
-        # are present before the screenshot is taken.
-        if max_spans_seen >= 80:
+        # With 2 workers (W1 + W2) doing 10 rounds each and 5 hello prints per round:
+        #   hello-world-transaction (coordinator, root)          1
+        #   worker-round x20 (W1×10 + W2×10, non-deterministic) 20
+        #     worker-get-work x20                                20
+        #     worker-run-hello x20                               20
+        #       hello-world-iteration x20x5=100                 100
+        #         hello-world-{guard,print,advance} x300        300
+        #     worker-2pc-prepare x20                             20
+        #     worker-2pc-commit x20                              20
+        # Total: ~501 spans.  Require ≥ 300 to ensure both workers have completed
+        # multiple rounds and their spans are truly interleaved in the waterfall.
+        if max_spans_seen >= 300:
             break
         time.sleep(5)
 
@@ -219,19 +219,18 @@ def _publish_pr_comment(screenshot_path: str) -> None:
         "*Distributed trace: the coordinator's `hello-world-transaction` root span "
         "(service: **coordinator**) contains `worker-round` spans from W1 and W2 "
         "running **in parallel** (services: **worker-W1**, **worker-W2**), "
-        "each doing multiple rounds that nest `worker-get-work` → `worker-run-hello` → "
+        "each doing **10 rounds** that nest `worker-get-work` → `worker-run-hello` → "
         "`hello-world-iteration` → `hello-world-guard` / `hello-world-print` / "
         "`hello-world-advance` grandchild spans (service: **hello-bas**).  "
-        "W3C traceparent from `/register` links all worker spans back to the "
-        "single coordinator-owned root, showing the distributed hello-world "
-        "computation — with both workers printing hello world concurrently — "
-        "in one unified multi-colour trace waterfall:  \n"
+        "The two workers compete for work tickets concurrently — their `worker-round` "
+        "spans are **non-deterministically interleaved** in the waterfall, showing "
+        "how different workers handle different parts of the same transaction:  \n"
         "`hello-world-transaction` (coordinator)  \n"
-        "├── `worker-round` ×2 (worker-W1, 2 rounds)  \n"
+        "├── `worker-round` ×10 (worker-W1, non-deterministic order)  \n"
         "│   ├── `worker-get-work`  \n"
         "│   ├── `worker-run-hello` → `hello-world-iteration` ×5 (hello-bas)  \n"
         "│   └── `worker-2pc-prepare` / `worker-2pc-commit`  \n"
-        "└── `worker-round` ×2 (worker-W2, 2 rounds)  \n"
+        "└── `worker-round` ×10 (worker-W2, interleaved with W1)  \n"
         "    └── … same structure …*"
     )
     comment_url = f"{api}/repos/{repo}/issues/{pr_number}/comments"
