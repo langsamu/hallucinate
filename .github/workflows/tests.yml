@@ -137,12 +137,12 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-      - name: Upload Jaeger screenshot as artifact
+      - name: Upload Jaeger screenshots as artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: jaeger-trace-screenshot
-          path: screenshots/jaeger-trace.png
+          name: jaeger-trace-screenshots
+          path: screenshots/
           if-no-files-found: warn
           retention-days: 30
 
