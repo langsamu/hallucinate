@@ -1,0 +1,9 @@
+# k8s/configmap.yaml
+#
+# Cluster-wide configuration shared by coordinator and worker pods.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hello-bas-config
+data:
+  otel_endpoint: "http://otel-collector:4318"

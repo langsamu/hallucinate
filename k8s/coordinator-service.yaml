@@ -1,0 +1,15 @@
+# k8s/coordinator-service.yaml
+#
+# Exposes the coordinator's HTTP port cluster-internally on port 8080.
+# Workers connect to http://coordinator:8080 within the cluster.
+apiVersion: v1
+kind: Service
+metadata:
+  name: coordinator
+spec:
+  selector:
+    app: coordinator
+  ports:
+    - protocol: TCP
+      port: 8080
+      targetPort: 8080

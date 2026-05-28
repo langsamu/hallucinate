@@ -1,0 +1,41 @@
+# k8s/worker-deployment.yaml
+#
+# Deploys three hello-world worker replicas.  Each worker registers with
+# the coordinator, requests work tickets, runs hello.bas, and participates
+# in 2PC.  Workers are stateless — scale freely.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  labels:
+    app: worker
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+    spec:
+      containers:
+        - name: worker
+          image: hello-bas:latest
+          args: ["worker.bas"]
+          env:
+            - name: OTEL_SERVICE_NAME
+              value: worker
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              valueFrom:
+                configMapKeyRef:
+                  name: hello-bas-config
+                  key: otel_endpoint
+            - name: COORD_URL
+              value: http://coordinator:8080
+            - name: WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name   # pod name as worker ID
+            - name: WORK_ROUNDS
+              value: "10"

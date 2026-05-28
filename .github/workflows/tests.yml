@@ -1,0 +1,266 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: write       # needed to commit the Jaeger screenshot to the branch
+  pull-requests: write  # needed to post the screenshot as a PR comment
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Start Jaeger
+        # Jaeger all-in-one accepts OTLP gRPC on its internal port 4317.
+        # We map that to HOST port 4316 to avoid collision with the OTel
+        # Collector, which already owns host port 4317.  The Jaeger UI is
+        # available at http://localhost:16686.
+        run: |
+          docker run -d \
+            --name jaeger \
+            -p 16686:16686 \
+            -p 4316:4317 \
+            jaegertracing/all-in-one:1.57
+          echo "Waiting for Jaeger UI on port 16686..."
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:16686/ > /dev/null 2>&1; then
+              echo "Jaeger is ready"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Start OpenTelemetry Collector
+        # GitHub Actions service container volumes cannot bind-mount individual
+        # files (only directories), so we start the collector as a regular step
+        # using `docker run` where per-file and per-directory mounts work correctly.
+        # We mount the otel-signals/ directory from the host into /signals/ inside
+        # the container, so the file exporter writes directly to the host — no
+        # docker cp step required.
+        run: |
+          mkdir -p otel-signals
+          # The otelcol user inside the container (UID 10001) must be able to write
+          # to the /signals mount, which is owned by the runner user on the host.
+          # Make the directory world-writable so the container user can create files.
+          chmod 777 otel-signals
+          docker run -d \
+            --name otel-collector \
+            --network host \
+            -v "${{ github.workspace }}/otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml" \
+            -v "${{ github.workspace }}/otel-signals:/signals" \
+            otel/opentelemetry-collector-contrib:0.100.0
+          # Wait up to 30 seconds for the OTLP HTTP port (4318) to be ready.
+          for i in $(seq 1 30); do
+            if wget -qO- http://localhost:4318 2>&1 | grep -q "404 page not found"; then
+              echo "OTel Collector is ready on port 4318"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        env:
+          OTEL_EXPORTER_OTLP_ENDPOINT: "http://localhost:4318"
+        run: python run_tests.py
+
+      - name: Visualize OpenTelemetry signals
+        if: always()
+        run: |
+          echo "=========================================="
+          echo "OPENTELEMETRY COLLECTOR SIGNAL OUTPUT:"
+          echo "=========================================="
+          docker logs otel-collector 2>&1 | grep -E "(LogRecord|Span|Metric|hello|HELLO|iteration|RECOVERED)" | head -100 || true
+          echo "=========================================="
+          echo "OPENTELEMETRY COLLECTOR FULL LOGS (last 50 lines):"
+          echo "=========================================="
+          docker logs otel-collector 2>&1 | tail -50 || true
+
+      - name: Screenshot Jaeger trace and post as PR comment
+        # Take a headless-browser screenshot of the Jaeger UI showing the
+        # hello-world trace with nested spans.  The screenshot is saved to
+        # screenshots/jaeger-trace.png, then uploaded to the PR branch and
+        # posted as an embedded-image PR comment via the GitHub API.
+        #
+        # The posting is done entirely in Python (screenshot_jaeger.py) to
+        # avoid the shell ARG_MAX limit that breaks `gh api -F content=<b64>`
+        # when the PNG exceeds ~128 KB.
+        #
+        # Failures here are non-fatal — tests already passed above.
+        if: always()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_HEAD_REF: ${{ github.head_ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          pip install playwright requests
+          playwright install chromium --with-deps
+          python screenshot_jaeger.py
+
+      - name: Stop OTel Collector and Jaeger, list signal files
+        if: always()
+        run: |
+          docker stop otel-collector 2>/dev/null || true
+          docker rm   otel-collector 2>/dev/null || true
+          docker stop jaeger 2>/dev/null || true
+          docker rm   jaeger 2>/dev/null || true
+          # Signal files are written directly to otel-signals/ on the host
+          # (mounted into the container as /signals/) — no docker cp needed.
+          ls -lh otel-signals/ || true
+
+      - name: Upload OTel signals as artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opentelemetry-signals
+          path: otel-signals/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload Jaeger screenshots as artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jaeger-trace-screenshots
+          path: screenshots/
+          if-no-files-found: warn
+          retention-days: 30
+
+  k8s-integration:
+    runs-on: ubuntu-latest
+    # Run the full distributed scenario inside a real Kubernetes cluster.
+    # Two worker pods (W1 and W2) and one coordinator pod are deployed via
+    # kind; all pods emit OTLP spans to an in-cluster OTel Collector which
+    # forwards them to Jaeger.  The Jaeger UI is port-forwarded to the
+    # runner and a screenshot of the distributed trace waterfall is taken
+    # and posted as a PR comment.
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install kind
+        run: |
+          curl -Lo /tmp/kind https://kind.sigs.k8s.io/dl/v0.23.0/kind-linux-amd64
+          chmod +x /tmp/kind
+          sudo mv /tmp/kind /usr/local/bin/kind
+          kind version
+
+      - name: Create kind cluster
+        run: kind create cluster --name hello-bas --wait 60s
+
+      - name: Build and load Docker image into kind
+        run: |
+          docker build -t hello-bas:latest .
+          kind load docker-image hello-bas:latest --name hello-bas
+
+      - name: Deploy OTel infrastructure (Collector + Jaeger)
+        run: |
+          kubectl apply -f k8s/otel-collector-configmap.yaml
+          kubectl apply -f k8s/configmap.yaml
+          kubectl apply -f k8s/otel-collector-deployment.yaml
+          kubectl apply -f k8s/otel-collector-service.yaml
+          kubectl apply -f k8s/jaeger-deployment.yaml
+          kubectl apply -f k8s/jaeger-service.yaml
+
+      - name: Deploy coordinator
+        run: |
+          kubectl apply -f k8s/coordinator-deployment.yaml
+          kubectl apply -f k8s/coordinator-service.yaml
+
+      - name: Wait for infrastructure to be ready
+        run: |
+          kubectl rollout status deployment/otel-collector --timeout=120s
+          kubectl rollout status deployment/jaeger --timeout=120s
+          kubectl rollout status deployment/coordinator --timeout=120s
+
+      - name: Deploy worker Jobs (W1 and W2 in parallel)
+        run: |
+          kubectl apply -f k8s/worker-1-job.yaml
+          kubectl apply -f k8s/worker-2-job.yaml
+
+      - name: Wait for worker Jobs to complete
+        run: |
+          kubectl wait --for=condition=complete job/worker-1 --timeout=180s
+          kubectl wait --for=condition=complete job/worker-2 --timeout=180s
+
+      - name: Port-forward Jaeger UI to localhost:16686
+        run: |
+          kubectl port-forward service/jaeger 16686:16686 &
+          echo "Waiting for Jaeger port-forward to be ready..."
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:16686/ > /dev/null 2>&1; then
+              echo "Jaeger UI ready at http://localhost:16686"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Screenshot Jaeger (k8s) and post as PR comment
+        # Takes a screenshot of the Jaeger distributed trace from the k8s
+        # cluster and posts it as a labelled PR comment.
+        if: always()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_HEAD_REF: ${{ github.head_ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          CONTEXT_LABEL: "Kubernetes"
+        run: |
+          pip install playwright requests
+          playwright install chromium --with-deps
+          python screenshot_jaeger.py
+
+      - name: Collect pod logs
+        if: always()
+        run: |
+          echo "=== OTel Collector logs ==="
+          kubectl logs -l app=otel-collector --tail=100 2>/dev/null || true
+          echo "=== Coordinator logs ==="
+          kubectl logs -l app=coordinator --tail=50 2>/dev/null || true
+          echo "=== Worker-1 logs ==="
+          kubectl logs job/worker-1 --tail=50 2>/dev/null || true
+          echo "=== Worker-2 logs ==="
+          kubectl logs job/worker-2 --tail=50 2>/dev/null || true
+
+      - name: Stop port-forward and delete kind cluster
+        if: always()
+        run: |
+          pkill -f "kubectl port-forward" 2>/dev/null || true
+          kind delete cluster --name hello-bas || true
+
+      - name: Upload Jaeger screenshot (k8s) as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jaeger-k8s-trace-screenshot
+          path: screenshots/jaeger-kubernetes-trace.png
+          if-no-files-found: warn
+          retention-days: 30
+

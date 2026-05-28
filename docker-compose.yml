@@ -1,0 +1,75 @@
+# docker-compose.yml — simulates the distributed hello-world cluster locally.
+#
+# Services
+# --------
+#   coordinator   BASIC coordinator (ACID 2PC, work queue, auth)
+#   worker-1      First hello-world worker
+#   worker-2      Second hello-world worker
+#   worker-3      Third hello-world worker
+#   nginx         TLS terminator (HTTPS on :8443, proxies to coordinator :8080)
+#
+# Usage
+# -----
+#   docker compose up --build
+#
+# Workers register with the coordinator, receive work tickets, run hello.bas,
+# and perform 2PC commit.  All OTel signals are emitted to the configured
+# OTLP endpoint (set OTEL_EXPORTER_OTLP_ENDPOINT in the environment or in
+# a .env file).
+
+services:
+
+  coordinator:
+    build: .
+    command: ["coordinator.bas"]
+    environment:
+      OTEL_SERVICE_NAME: coordinator
+      OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4318}"
+    ports:
+      - "8080:8080"
+
+  worker-1:
+    build: .
+    command: ["worker.bas"]
+    environment:
+      OTEL_SERVICE_NAME: worker-1
+      OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4318}"
+      WORKER_ID: W1
+      COORD_URL: http://coordinator:8080
+      WORK_ROUNDS: "5"
+    depends_on:
+      - coordinator
+
+  worker-2:
+    build: .
+    command: ["worker.bas"]
+    environment:
+      OTEL_SERVICE_NAME: worker-2
+      OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4318}"
+      WORKER_ID: W2
+      COORD_URL: http://coordinator:8080
+      WORK_ROUNDS: "5"
+    depends_on:
+      - coordinator
+
+  worker-3:
+    build: .
+    command: ["worker.bas"]
+    environment:
+      OTEL_SERVICE_NAME: worker-3
+      OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT:-http://localhost:4318}"
+      WORKER_ID: W3
+      COORD_URL: http://coordinator:8080
+      WORK_ROUNDS: "5"
+    depends_on:
+      - coordinator
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "8443:8443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+    depends_on:
+      - coordinator

@@ -1,0 +1,16 @@
+# k8s/otel-collector-service.yaml
+#
+# ClusterIP service for the OpenTelemetry Collector.
+# Pods send OTLP/HTTP traces to http://otel-collector:4318 — the value
+# stored in the hello-bas-config ConfigMap under the otel_endpoint key.
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector
+spec:
+  selector:
+    app: otel-collector
+  ports:
+    - name: otlp-http
+      port: 4318
+      targetPort: 4318

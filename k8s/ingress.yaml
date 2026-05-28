@@ -1,0 +1,30 @@
+# k8s/ingress.yaml
+#
+# TLS-terminating ingress for the coordinator HTTP API.
+# Handles bearer-token authentication pass-through and W3C
+# trace-context header forwarding for distributed tracing.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: coordinator-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      proxy_set_header traceparent $http_traceparent;
+      proxy_set_header tracestate  $http_tracestate;
+spec:
+  tls:
+    - hosts:
+        - hello-bas.local
+      secretName: hello-bas-tls
+  rules:
+    - host: hello-bas.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: coordinator
+                port:
+                  number: 8080

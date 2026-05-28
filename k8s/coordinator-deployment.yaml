@@ -1,0 +1,42 @@
+# k8s/coordinator-deployment.yaml
+#
+# Deploys the BASIC coordinator as a single-replica Kubernetes Deployment.
+# The coordinator is stateful (in-memory TID counter, phase state) so it
+# runs as a single replica; horizontal scaling would require an external
+# store (e.g. Redis) for the shared state, which is out of scope here.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coordinator
+  labels:
+    app: coordinator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: coordinator
+  template:
+    metadata:
+      labels:
+        app: coordinator
+    spec:
+      containers:
+        - name: coordinator
+          image: hello-bas:latest
+          imagePullPolicy: Never
+          args: ["coordinator.bas"]
+          ports:
+            - containerPort: 8080
+          env:
+            - name: OTEL_SERVICE_NAME
+              value: coordinator
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              valueFrom:
+                configMapKeyRef:
+                  name: hello-bas-config
+                  key: otel_endpoint
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 3

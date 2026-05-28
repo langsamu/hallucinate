@@ -1,0 +1,70 @@
+# OpenTelemetry Collector configuration for hello.bas observability
+#
+# Receives OTLP signals (traces, metrics, logs) from the BASIC emulator over
+# HTTP on port 4318, then exports them three ways:
+#
+#   debug        - prints every signal in human-readable detail to the
+#                  collector's own stdout so CI can capture it with
+#                  "docker logs".
+#
+#   file/traces  - writes OTLP JSON trace records to /signals/otel-traces.json
+#                  (importable into Jaeger via File > Import Trace).
+#
+#   file/metrics - writes OTLP JSON metric records to /signals/otel-metrics.json.
+#
+#   file/logs    - writes OTLP JSON log records to /signals/otel-logs.json.
+#
+#   otlp/jaeger  - forwards traces live to the Jaeger all-in-one container
+#                  (gRPC OTLP receiver inside Jaeger, mapped to host port 4316
+#                  to avoid conflict with the collector's own 4317 gRPC port).
+#                  This lets CI screenshot the Jaeger UI and post the image as
+#                  a PR comment showing the nested span hierarchy.
+#
+# Each signal type gets its own file so the CI "Upload OTel signals" step can
+# attach them as separate named artifacts.
+#
+# NOTE: No batch processor is used. Signals are exported immediately as they
+# arrive so that the file exporter writes its output promptly.
+#
+# NOTE: The /signals directory is a host directory mounted into the container
+# at startup (-v .../otel-signals:/signals), so files written here are
+# directly available on the host without needing docker cp.
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: "0.0.0.0:4318"
+
+exporters:
+  debug:
+    verbosity: detailed
+
+  file/traces:
+    path: /signals/otel-traces.json
+
+  file/metrics:
+    path: /signals/otel-metrics.json
+
+  file/logs:
+    path: /signals/otel-logs.json
+
+  # Forward traces to Jaeger's OTLP gRPC receiver.
+  # Jaeger is started in CI with its internal gRPC port (4317) mapped to
+  # host port 4316 to avoid collision with this collector's own 4317 port.
+  otlp/jaeger:
+    endpoint: "localhost:4316"
+    tls:
+      insecure: true
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [debug, file/traces, otlp/jaeger]
+    metrics:
+      receivers: [otlp]
+      exporters: [debug, file/metrics]
+    logs:
+      receivers: [otlp]
+      exporters: [debug, file/logs]
